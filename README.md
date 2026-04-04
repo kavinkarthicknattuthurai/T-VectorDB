@@ -40,7 +40,7 @@ We ran a heavy workload benchmark of **100,000 vectors** (1536 dimensions, OpenA
 Ensure you have Rust installed, then clone and run:
 
 ```bash
-git clone https://github.com/your-username/T-VectorDB
+git clone https://github.com/kavinkarthicknattuthurai/T-VectorDB.git
 cd T-VectorDB
 cargo run --release
 ```
