@@ -104,6 +104,7 @@ impl TVector for TVectorService {
         }
 
         let top_k = if req.top_k == 0 { 5 } else { req.top_k as usize };
+        let ef = if req.ef_search == 0 { 100 } else { req.ef_search as usize };
 
         let valid_ids = self.state.db.get_filtered_ids(&req.filter);
 
@@ -113,16 +114,23 @@ impl TVector for TVectorService {
                 "exact (hybrid)",
             )
         } else {
-            let ram_guard = self.state.db.ram.read().unwrap();
-            let res = search_ram_store_with_options(
-                &self.state.index,
-                &ram_guard,
-                &req.query,
-                top_k,
-                false, // Disable QJL to prevent noise
-                valid_ids.as_ref(),
-            );
-            (res, "approximate")
+            let graph = self.state.db.hnsw.read().unwrap();
+            if graph.is_empty() {
+                let ram_guard = self.state.db.ram.read().unwrap();
+                let res = search_ram_store_with_options(
+                    &self.state.index,
+                    &ram_guard,
+                    &req.query,
+                    top_k,
+                    false, // Disable QJL to prevent noise
+                    valid_ids.as_ref(),
+                );
+                (res, "approximate (linear)")
+            } else {
+                let ram_guard = self.state.db.ram.read().unwrap();
+                let res = graph.search(&req.query, &self.state.index, &ram_guard, top_k, ef, valid_ids.as_ref());
+                (res, "approximate (hnsw)")
+            }
         };
 
         let grpc_results = results

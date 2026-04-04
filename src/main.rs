@@ -10,6 +10,7 @@ use std::sync::Arc;
 mod turbo_math;
 mod storage_engine;
 mod execution_engine;
+mod hnsw;
 mod api_server;
 mod grpc_server;
 
@@ -98,6 +99,9 @@ async fn main() {
     tracing::info!("Opening database at: {}", data_dir);
     let db = Database::new(&data_dir).expect("Failed to open database");
     tracing::info!("Database ready. Vectors loaded: {}", db.len());
+
+    // Rebuild HNSW graph from persisted vectors
+    db.rebuild_hnsw(&index);
 
     // Build shared state
     let state = Arc::new(AppState {

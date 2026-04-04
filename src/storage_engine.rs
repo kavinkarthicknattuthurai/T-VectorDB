@@ -168,15 +168,20 @@ pub fn compress_vector(index: &TurboIndex, vector: &[f32], id: u64) -> PackedVec
 
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
+use crate::hnsw::{HnswConfig, HnswGraph};
 
-/// Two-tier database with persistence.
+/// Two-tier database with persistence and HNSW graph index.
 ///
 /// - RAM: Compressed vectors for fast approximate search
+/// - HNSW: Multi-layer graph for O(log n) search
 /// - Inverted Index: Optional metadata string-matching
 /// - Disk (sled): Full-precision vectors and serialized metadata
 pub struct Database {
     /// Tier 1: Compressed vectors in RAM (RwLock protected)
     pub ram: RwLock<Vec<PackedVector>>,
+
+    /// HNSW graph index for sub-linear search
+    pub hnsw: RwLock<HnswGraph>,
 
     /// Inverted Index mapping `key:value` to a set of Vector IDs
     pub inverted_index: RwLock<HashMap<String, HashSet<u64>>>,
@@ -186,7 +191,7 @@ pub struct Database {
 }
 
 impl Database {
-    /// Create or open the database. Rebuilds inverted index on startup.
+    /// Create or open the database. Rebuilds inverted index and HNSW graph on startup.
     pub fn new(path: &str) -> Result<Self, sled::Error> {
         let disk = sled::open(path)?;
 
@@ -214,15 +219,41 @@ impl Database {
             }
         }
 
+        // Initialize empty HNSW graph (will be rebuilt after index is available)
+        let hnsw = HnswGraph::new(HnswConfig::default());
+
         if !ram.is_empty() {
             tracing::info!("Restored {} compressed vectors from disk", ram.len());
         }
 
         Ok(Database { 
             ram: RwLock::new(ram), 
+            hnsw: RwLock::new(hnsw),
             inverted_index: RwLock::new(inverted_index),
             disk 
         })
+    }
+
+    /// Rebuild the HNSW graph from the existing RAM vectors.
+    /// Called once after startup when the TurboIndex is available.
+    pub fn rebuild_hnsw(&self, index: &TurboIndex) {
+        let ram = self.ram.read().unwrap();
+        let n = ram.len();
+        if n == 0 { return; }
+
+        tracing::info!("Rebuilding HNSW graph for {} vectors...", n);
+        let start = std::time::Instant::now();
+
+        let mut graph = HnswGraph::new(HnswConfig::default());
+        for i in 0..n {
+            graph.insert(i, &ram, index);
+        }
+
+        let elapsed = start.elapsed();
+        tracing::info!("HNSW graph built in {:.2?} ({} nodes, {} layers)",
+            elapsed, graph.len(), graph.max_layer_count());
+
+        *self.hnsw.write().unwrap() = graph;
     }
 
     /// Insert a vector with optional metadata
@@ -256,7 +287,15 @@ impl Database {
             }
         }
 
+        // Push compressed vector to RAM
         self.ram.write().unwrap().push(packed);
+
+        // Insert into HNSW graph using the raw vector for best graph quality
+        let ram = self.ram.read().unwrap();
+        let node_idx = ram.len() - 1;
+        let mut graph = self.hnsw.write().unwrap();
+        graph.insert_with_raw(node_idx, &ram, index, Some(vector));
+
         Ok(())
     }
 

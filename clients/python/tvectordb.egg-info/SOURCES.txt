@@ -1,0 +1,11 @@
+README.md
+setup.py
+tvectordb/__init__.py
+tvectordb/client.py
+tvectordb/tvectordb_pb2.py
+tvectordb/tvectordb_pb2_grpc.py
+tvectordb.egg-info/PKG-INFO
+tvectordb.egg-info/SOURCES.txt
+tvectordb.egg-info/dependency_links.txt
+tvectordb.egg-info/requires.txt
+tvectordb.egg-info/top_level.txt

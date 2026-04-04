@@ -1,0 +1,8 @@
+target/
+clients/python/build/
+clients/python/tvectordb.egg-info/
+data/
+.git/
+.env
+Dockerfile
+.dockerignore

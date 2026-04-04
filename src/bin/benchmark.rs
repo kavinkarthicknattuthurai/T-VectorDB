@@ -5,6 +5,7 @@ use std::time::Instant;
 use tvectordb::execution_engine::search_ram_store;
 use tvectordb::storage_engine::{compress_vector, PackedVector};
 use tvectordb::turbo_math::{BitWidth, TurboIndex};
+use tvectordb::hnsw::{HnswConfig, HnswGraph};
 
 struct BenchmarkResult {
     bits: usize,
@@ -14,8 +15,11 @@ struct BenchmarkResult {
     original_mb: f64,
     compressed_mb: f64,
     compression_ratio: f64,
-    avg_search_ms: f64,
-    qps: f64,
+    hnsw_build_time_ms: f64,
+    linear_avg_search_ms: f64,
+    linear_qps: f64,
+    hnsw_avg_search_ms: f64,
+    hnsw_qps: f64,
     self_recall: f64,
 }
 
@@ -38,23 +42,40 @@ fn run_benchmark(d: usize, bits: BitWidth, num_vectors: usize) -> BenchmarkResul
     }
     let compress_time = start.elapsed();
 
+    // Build HNSW Graph
+    let start = Instant::now();
+    let config = HnswConfig { m: 16, m_max0: 32, ef_construction: 200, ..Default::default() };
+    let mut graph = HnswGraph::new(config);
+    for (i, v) in raw_vectors.iter().enumerate() {
+        graph.insert_with_raw(i, &db, &index, Some(v));
+    }
+    let hnsw_build_time = start.elapsed();
+
     // Memory
     let original_size = num_vectors * d * 4;
     let compressed_size: usize = db.iter().map(|v| v.size_bytes()).sum();
 
-    // Search latency (search for 50 known vectors, check if they are top-1)
-    let search_runs = 50.min(num_vectors);
+    let search_runs = 100.min(num_vectors);
+
+    // Linear Search latency
+    let start = Instant::now();
+    for i in 0..search_runs {
+        let query = &raw_vectors[i];
+        let _results = search_ram_store(&index, &db, query, 10, None);
+    }
+    let linear_search_time = start.elapsed() / search_runs as u32;
+
+    // HNSW Search latency (search for known vectors, check if they are top-1)
     let start = Instant::now();
     let mut hits = 0;
     for i in 0..search_runs {
         let query = &raw_vectors[i];
-        let results = search_ram_store(&index, &db, query, 1, None);
+        let results = graph.search(query, &index, &db, 10, 200, None);
         if !results.is_empty() && results[0].0 == i as u64 {
             hits += 1;
         }
     }
-    let total_search_time = start.elapsed();
-    let avg_search_time = total_search_time / search_runs as u32;
+    let hnsw_search_time = start.elapsed() / search_runs as u32;
 
     BenchmarkResult {
         bits: bits.bits(),
@@ -64,8 +85,11 @@ fn run_benchmark(d: usize, bits: BitWidth, num_vectors: usize) -> BenchmarkResul
         original_mb: original_size as f64 / 1_048_576.0,
         compressed_mb: compressed_size as f64 / 1_048_576.0,
         compression_ratio: original_size as f64 / compressed_size as f64,
-        avg_search_ms: avg_search_time.as_secs_f64() * 1000.0,
-        qps: 1.0 / avg_search_time.as_secs_f64(),
+        hnsw_build_time_ms: hnsw_build_time.as_secs_f64() * 1000.0,
+        linear_avg_search_ms: linear_search_time.as_secs_f64() * 1000.0,
+        linear_qps: 1.0 / linear_search_time.as_secs_f64(),
+        hnsw_avg_search_ms: hnsw_search_time.as_secs_f64() * 1000.0,
+        hnsw_qps: 1.0 / hnsw_search_time.as_secs_f64(),
         self_recall: hits as f64 / search_runs as f64 * 100.0,
     }
 }
@@ -101,15 +125,16 @@ fn main() {
     println!("└────────┴───────────┴──────────────┴──────────────┴─────────────┘");
 
     println!();
+    println!();
     println!("⚡ SEARCH PERFORMANCE");
-    println!("┌────────┬─────────────────┬─────────────┬──────────────┐");
-    println!("│  Bits  │ Avg Search (ms) │    QPS      │ Self-Recall  │");
-    println!("├────────┼─────────────────┼─────────────┼──────────────┤");
+    println!("┌────────┬────────────────┬──────────┬──────────────┬────────────┬─────────────┐");
+    println!("│  Bits  │ Linear Avg(ms) │Linear QPS│ HNSW Avg(ms) │  HNSW QPS  │ Self-Recall │");
+    println!("├────────┼────────────────┼──────────┼──────────────┼────────────┼─────────────┤");
     for r in &results {
-        println!("│ {}-bit  │ {:>15.2} │ {:>11.0} │ {:>10.1}%  │",
-            r.bits, r.avg_search_ms, r.qps, r.self_recall);
+        println!("│ {}-bit  │ {:>14.2} │ {:>8.0} │ {:>12.2} │ {:>10.0} │ {:>10.1}% │",
+            r.bits, r.linear_avg_search_ms, r.linear_qps, r.hnsw_avg_search_ms, r.hnsw_qps, r.self_recall);
     }
-    println!("└────────┴─────────────────┴─────────────┴──────────────┘");
+    println!("└────────┴────────────────┴──────────┴──────────────┴────────────┴─────────────┘");
 
     println!();
     println!("🔧 INGESTION SPEED");

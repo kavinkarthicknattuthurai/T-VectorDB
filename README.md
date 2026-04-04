@@ -11,6 +11,7 @@ Unlike traditional databases that require slow global locks or K-Means warmups, 
 | Feature | T-VectorDB V3 | turboqvec | Qdrant | Pinecone |
 |---------|:---:|:---:|:---:|:---:|
 | TurboQuant 2/3/4-bit | ✅ | ✅ | ❌ | ❌ |
+| **HNSW Graph Index** | ✅ Compressed | ❌ | ✅ | ✅ |
 | **Hybrid Re-Rank (100% Accuracy)** | ✅ | ❌ | ❌ | ❌ |
 | **Binary gRPC Protocol** | ✅ Zero-Copy | ❌ | ✅ | ✅ |
 | **Lock-Free Concurrency** | ✅ | ❌ | ✅ | ✅ |
@@ -25,7 +26,7 @@ Unlike traditional databases that require slow global locks or K-Means warmups, 
 1. **Orthogonal Rotation (Π):** Rotate incoming vectors using a random orthogonal matrix. The Central Limit Theorem forces coordinates into a predictable Gaussian shape.
 2. **Lloyd-Max Quantization:** Snap each coordinate to the mathematically optimal centroid for 2/3/4-bit precision. No training needed — buckets are predetermined.
 3. **QJL Residual (1-bit):** Project quantization error through a Gaussian matrix and store only the signs. Corrects inner product bias.
-4. **Asymmetric Search (LUT):** At query time, build a lookup table once. Score millions of vectors per second using table reads — never decompress.
+4. **HNSW Graph on Compressed Data:** Vectors are placed into a Hierarchical Navigable Small World graph. At query time, we walk the graph using *compressed* approximate distances (LUTs). This shifts search time from $O(n)$ to **$O(\log n)$**, enabling millisecond searches on millions of vectors natively in RAM.
 
 ## 🎯 Hybrid Two-Tier Search — 100% Accuracy Mode
 
@@ -35,9 +36,10 @@ This is our **unique advantage** that no other vector database offers:
  ┌──────────────────────────────────────────────────────────────────┐
  │  Client sends: {"exact": true}                                  │
  │                                                                  │
- │  Stage 1: RAM Approximate Scan                                  │
- │  ├─ Scans ALL compressed vectors using LUT (sub-millisecond)    │
- │  ├─ Produces Top-100 shortlist from millions of vectors         │
+ │                                                                  │
+ │  Stage 1: RAM Approximate Scan (HNSW)                          │
+ │  ├─ Traverses the HNSW graph using LUTs (sub-millisecond)      │
+ │  ├─ Produces Top-100 shortlist in O(log n) time                │
  │  └─ Uses 2/3/4-bit packed memory (10x less RAM)                │
  │                                                                  │
  │  Stage 2: Disk Exact Re-Rank                                    │
@@ -116,6 +118,13 @@ results = client.search(
     filter={"category": "finance"}  # O(1) pre-filter
 )
 
+# Advanced: Tune HNSW search beam width (higher = more accurate but slower)
+results = client.search(
+    vector=query, 
+    top_k=5, 
+    ef_search=200            # Default is 100
+)
+
 # Batch operations
 client.insert_batch([(1, vec1, {"tag": "a"}), (2, vec2, None)])
 client.delete(id=1)
@@ -170,12 +179,13 @@ curl -X POST http://localhost:3000/search \
                   │     Lock-Free TurboQuant      │
                   │   O(1) Metadata Pre-Filter    │
                   │   Rotate → Quantize → Pack    │
+                  │     Insert into HNSW Graph    │
                   └──────┬──────────────┬────────┘
                          │              │
                   ┌──────▼──────┐ ┌─────▼────────┐
                   │  RAM Store  │ │  Sled (Disk)  │
-                  │ Packed LUT  │ │ Float32 + Meta│
-                  │ (fast scan) │ │ (exact vals)  │
+                  │ HNSW Index  │ │ Float32 + Meta│
+                  │ (O(log n))  │ │ (exact vals)  │
                   └─────────────┘ └──────────────┘
 ```
 

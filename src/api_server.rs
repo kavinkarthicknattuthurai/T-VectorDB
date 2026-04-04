@@ -73,9 +73,12 @@ pub struct SearchRequest {
     pub top_k: usize,
     #[serde(default)]
     pub filter: std::collections::HashMap<String, String>,
+    #[serde(default = "default_ef_search")]
+    pub ef_search: usize,
 }
 
 fn default_top_k() -> usize { 5 }
+fn default_ef_search() -> usize { 100 }
 
 #[derive(serde::Deserialize)]
 pub struct BatchSearchRequest {
@@ -155,11 +158,13 @@ async fn insert_one(
     let meta_opt = if payload.metadata.is_empty() { None } else { Some(&payload.metadata) };
 
     match state.db.insert(&state.index, &payload.vector, payload.id, meta_opt) {
-        Ok(()) => Ok(Json(InsertResponse {
-            success: true,
-            message: format!("Vector {} inserted ({})", payload.id, state.index.bits.bits()),
-            id: payload.id,
-        })),
+        Ok(()) => {
+            Ok(Json(InsertResponse {
+                success: true,
+                message: format!("Vector {} inserted ({})", payload.id, state.index.bits.bits()),
+                id: payload.id,
+            }))
+        },
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Insert failed: {}", e))),
     }
 }
@@ -186,11 +191,15 @@ async fn insert_batch(
         .collect();
 
     match state.db.insert_batch(&state.index, &pairs) {
-        Ok(count) => Ok(Json(BatchInsertResponse {
-            success: true,
-            inserted: count,
-            total_vectors: state.db.len(),
-        })),
+        Ok(count) => {
+            // Rebuild HNSW for batch (more efficient than per-vector)
+            state.db.rebuild_hnsw(&state.index);
+            Ok(Json(BatchInsertResponse {
+                success: true,
+                inserted: count,
+                total_vectors: state.db.len(),
+            }))
+        },
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Batch insert failed: {}", e))),
     }
 }
@@ -212,11 +221,21 @@ async fn search(
     let valid_ids = state.db.get_filtered_ids(&payload.filter);
 
     let (results, mode) = if payload.exact {
+        // Exact hybrid: HNSW shortlist → disk re-rank → 100% accuracy
         (hybrid_search(&state.db, &state.index, &payload.vector, payload.top_k, valid_ids.as_ref()), "exact (hybrid)")
     } else {
-        let ram_guard = state.db.ram.read().unwrap();
-        let res = search_ram_store(&state.index, &ram_guard, &payload.vector, payload.top_k, valid_ids.as_ref());
-        (res, "approximate")
+        // Default: HNSW graph search — O(log n)
+        let graph = state.db.hnsw.read().unwrap();
+        if graph.is_empty() {
+            // Fallback to linear scan if graph not built
+            let ram_guard = state.db.ram.read().unwrap();
+            let res = search_ram_store(&state.index, &ram_guard, &payload.vector, payload.top_k, valid_ids.as_ref());
+            (res, "approximate (linear)")
+        } else {
+            let ram_guard = state.db.ram.read().unwrap();
+            let res = graph.search(&payload.vector, &state.index, &ram_guard, payload.top_k, payload.ef_search, valid_ids.as_ref());
+            (res, "approximate (hnsw)")
+        }
     };
 
     Ok(Json(SearchResponse {

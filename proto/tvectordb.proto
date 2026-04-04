@@ -44,6 +44,7 @@ message SearchRequest {
     bool exact = 2;       // If true, forces disk re-ranking (Two-Tier Hybrid Search)
     uint32 top_k = 3;
     map<string, string> filter = 4; // Required match for metadata tags
+    uint32 ef_search = 5;           // Optional: beam width for HNSW search (default: 100)
 }
 
 message SearchResult {

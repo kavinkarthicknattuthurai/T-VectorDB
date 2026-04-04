@@ -130,6 +130,7 @@ class TVectorClient:
         top_k: int = 5,
         exact: bool = False,
         filter: Optional[Dict[str, str]] = None,
+        ef_search: int = 100,
     ) -> List[dict]:
         """Search for the closest vectors to the query.
         
@@ -140,6 +141,8 @@ class TVectorClient:
                    If False, uses fast approximate RAM-only search.
             filter: Optional metadata filter. Only vectors matching ALL
                     key-value pairs will be considered.
+            ef_search: Beam width for HNSW approximate search. Higher = more accurate
+                       but slower (default: 100). Ignored if exact=True.
                     
         Returns:
             List of dicts with 'id' and 'score' fields, sorted by relevance
@@ -161,6 +164,7 @@ class TVectorClient:
             exact=exact,
             top_k=top_k,
             filter=filter or {},
+            ef_search=ef_search,
         )
         response = self.stub.Search(request)
         return [
