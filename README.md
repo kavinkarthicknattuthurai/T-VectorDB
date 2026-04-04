@@ -93,6 +93,31 @@ cargo run --release -- --dim 384 --bits 2 --port 8080
 | `--grpc-port` | 50051 | Binary gRPC port |
 | `--data` | ./data | Persistent storage directory |
 
+## 🐳 Docker Deployment (Production)
+
+For production environments (AWS, GCP, Kubernetes), you don't need to install Rust. You can run T-VectorDB as an isolated, hyper-optimized microservice container.
+
+**1. Build the container:**
+```bash
+docker build -t tvectordb .
+```
+
+**2. Run with Persistent Storage:**
+```bash
+# Maps local ./data folder to the container to ensure vectors survive reboots
+# Exposes both REST (3000) and gRPC (50051) ports
+docker run -d \
+  -p 3000:3000 -p 50051:50051 \
+  -v $(pwd)/data:/app/data \
+  tvectordb
+```
+
+**3. Advanced Configuration Override:**
+You can pass flags directly to the container to modify the database precision exactly like the CLI:
+```bash
+docker run -p 3000:3000 -p 50051:50051 tvectordb --dim 384 --bits 4
+```
+
 ## 🐍 Python SDK
 
 ```bash
