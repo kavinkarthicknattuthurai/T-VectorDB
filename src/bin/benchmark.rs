@@ -1,78 +1,128 @@
-//! Benchmark script for T-VectorDB
-//! Runs a heavy workload to prove performance metrics for the README.
+//! Benchmark V2: Tests all bit-widths and generates comparison tables
 
 use rand::Rng;
 use std::time::Instant;
 use tvectordb::execution_engine::search_ram_store;
 use tvectordb::storage_engine::{compress_vector, PackedVector};
-use tvectordb::turbo_math::TurboIndex;
+use tvectordb::turbo_math::{BitWidth, TurboIndex};
 
-fn main() {
-    let d = 1536; // Standard OpenAI embedding size
-    let num_vectors = 100_000;
-    
-    println!("🚀 Starting T-VectorDB Benchmarks");
-    println!("========================================");
-    println!("Dimension: {}", d);
-    println!("Target Count: {} vectors", num_vectors);
-    println!();
+struct BenchmarkResult {
+    bits: usize,
+    num_vectors: usize,
+    compress_time_ms: f64,
+    avg_compress_us: f64,
+    original_mb: f64,
+    compressed_mb: f64,
+    compression_ratio: f64,
+    avg_search_ms: f64,
+    qps: f64,
+    self_recall: f64,
+}
 
-    // 1. Math Initialization
-    print!("Initializing TurboIndex (QR Decomposition of {}x{} matrix)... ", d, d);
-    let start = Instant::now();
-    let index = TurboIndex::new(d);
-    let init_time = start.elapsed();
-    println!("{:.2?}", init_time);
-
-    // 2. Data Generation
-    print!("Generating random vectors... ");
+fn run_benchmark(d: usize, bits: BitWidth, num_vectors: usize) -> BenchmarkResult {
+    let index = TurboIndex::new(d, bits);
     let mut rng = rand::thread_rng();
-    let mut raw_vectors = Vec::with_capacity(num_vectors);
+
+    // Generate random vectors
+    let mut raw_vectors: Vec<Vec<f32>> = Vec::with_capacity(num_vectors);
     for _ in 0..num_vectors {
         let v: Vec<f32> = (0..d).map(|_| rng.gen::<f32>() - 0.5).collect();
         raw_vectors.push(v);
     }
-    println!("Done.");
 
-    // 3. Compression / Insertion Latency
-    print!("Compressing {} vectors to 3 bits... ", num_vectors);
+    // Compress
     let start = Instant::now();
     let mut db: Vec<PackedVector> = Vec::with_capacity(num_vectors);
     for (i, v) in raw_vectors.iter().enumerate() {
         db.push(compress_vector(&index, v, i as u64));
     }
     let compress_time = start.elapsed();
-    println!("{:.2?} (Avg: {:.2?} per vector)", compress_time, compress_time / num_vectors as u32);
-    
-    // 4. Memory footprint
-    let original_size = num_vectors * d * 4; // 4 bytes per f32
-    let packed_size = num_vectors * ((d / 4) + (d / 8) + 4 + 8); // mse + qjl + residual(4) + id(8)
-    println!();
-    println!("🧠 Memory Footprint:");
-    println!("Original (Float32): {:.2} MB", original_size as f32 / 1_048_576.0);
-    println!("T-VectorDB (3-bit): {:.2} MB", packed_size as f32 / 1_048_576.0);
-    println!("Compression Ratio:  {:.1}x smaller", original_size as f32 / packed_size as f32);
-    println!();
 
-    // 5. Search Latency
-    let query = &raw_vectors[num_vectors / 2]; // Use a known vector
-    let search_runs = 100;
-    print!("Benchmarking {} consecutive searches over fully packed DB... ", search_runs);
+    // Memory
+    let original_size = num_vectors * d * 4;
+    let compressed_size: usize = db.iter().map(|v| v.size_bytes()).sum();
+
+    // Search latency (search for 50 known vectors, check if they are top-1)
+    let search_runs = 50.min(num_vectors);
     let start = Instant::now();
-    for _ in 0..search_runs {
-        // Find top 10
-        let _results = search_ram_store(&index, &db, query, 10);
+    let mut hits = 0;
+    for i in 0..search_runs {
+        let query = &raw_vectors[i];
+        let results = search_ram_store(&index, &db, query, 1);
+        if !results.is_empty() && results[0].0 == i as u64 {
+            hits += 1;
+        }
     }
     let total_search_time = start.elapsed();
     let avg_search_time = total_search_time / search_runs as u32;
-    println!("Done.");
-    
-    let queries_per_sec = 1.0 / avg_search_time.as_secs_f64();
+
+    BenchmarkResult {
+        bits: bits.bits(),
+        num_vectors,
+        compress_time_ms: compress_time.as_secs_f64() * 1000.0,
+        avg_compress_us: compress_time.as_secs_f64() * 1_000_000.0 / num_vectors as f64,
+        original_mb: original_size as f64 / 1_048_576.0,
+        compressed_mb: compressed_size as f64 / 1_048_576.0,
+        compression_ratio: original_size as f64 / compressed_size as f64,
+        avg_search_ms: avg_search_time.as_secs_f64() * 1000.0,
+        qps: 1.0 / avg_search_time.as_secs_f64(),
+        self_recall: hits as f64 / search_runs as f64 * 100.0,
+    }
+}
+
+fn main() {
+    let d = 384;  // BGE-small-en-v1.5 dimension (comparable to turboqvec benchmarks)
+    let num_vectors = 10_000;
+
+    println!("🚀 T-VectorDB Benchmark Suite V2");
+    println!("========================================");
+    println!("Dimension: {}", d);
+    println!("Vectors:   {}", num_vectors);
+    println!();
+
+    println!("Running 2-bit benchmark...");
+    let r2 = run_benchmark(d, BitWidth::Bits2, num_vectors);
+    println!("Running 3-bit benchmark...");
+    let r3 = run_benchmark(d, BitWidth::Bits3, num_vectors);
+    println!("Running 4-bit benchmark...");
+    let r4 = run_benchmark(d, BitWidth::Bits4, num_vectors);
+
+    let results = [&r2, &r3, &r4];
 
     println!();
-    println!("⚡ Search Performance:");
-    println!("Avg Latency per query: {:.2?}", avg_search_time);
-    println!("Throughput:            {:.0} QPS (Queries Per Second)", queries_per_sec);
+    println!("📊 COMPRESSION & MEMORY");
+    println!("┌────────┬───────────┬──────────────┬──────────────┬─────────────┐");
+    println!("│  Bits  │  Vectors  │ Original (MB)│Compressed(MB)│  Ratio      │");
+    println!("├────────┼───────────┼──────────────┼──────────────┼─────────────┤");
+    for r in &results {
+        println!("│ {}-bit  │ {:>9} │ {:>12.2} │ {:>12.2} │ {:>9.1}x  │",
+            r.bits, r.num_vectors, r.original_mb, r.compressed_mb, r.compression_ratio);
+    }
+    println!("└────────┴───────────┴──────────────┴──────────────┴─────────────┘");
+
+    println!();
+    println!("⚡ SEARCH PERFORMANCE");
+    println!("┌────────┬─────────────────┬─────────────┬──────────────┐");
+    println!("│  Bits  │ Avg Search (ms) │    QPS      │ Self-Recall  │");
+    println!("├────────┼─────────────────┼─────────────┼──────────────┤");
+    for r in &results {
+        println!("│ {}-bit  │ {:>15.2} │ {:>11.0} │ {:>10.1}%  │",
+            r.bits, r.avg_search_ms, r.qps, r.self_recall);
+    }
+    println!("└────────┴─────────────────┴─────────────┴──────────────┘");
+
+    println!();
+    println!("🔧 INGESTION SPEED");
+    println!("┌────────┬────────────────────┬──────────────────┐");
+    println!("│  Bits  │ Total Compress (ms)│ Avg per vec (µs) │");
+    println!("├────────┼────────────────────┼──────────────────┤");
+    for r in &results {
+        println!("│ {}-bit  │ {:>18.1} │ {:>16.1} │",
+            r.bits, r.compress_time_ms, r.avg_compress_us);
+    }
+    println!("└────────┴────────────────────┴──────────────────┘");
+
+    println!();
     println!("========================================");
-    println!("Result: Crushing it. 🔨");
+    println!("✅ Benchmark complete. These numbers don't lie. 🔥");
 }

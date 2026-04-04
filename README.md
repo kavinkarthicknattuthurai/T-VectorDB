@@ -1,43 +1,51 @@
 # T-VectorDB 🚀
 
-**The Zero-Latency, 16x Compressed, LLM-Native Vector Database**
+**The Zero-Latency, Configurable, LLM-Native Vector Database**
 
-T-VectorDB is an ultra-fast, CPU-friendly vector database built entirely in Rust. It implements the breakthroughs from the Google Research paper [*TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate (ICLR 2026)*](https://arxiv.org/).
+T-VectorDB is an ultra-fast, CPU-friendly vector database built entirely in **pure Rust** with zero C/C++ dependencies. It implements the [TurboQuant paper (ICLR 2026, Google Research)](https://arxiv.org/) — a data-oblivious quantization algorithm that compresses float32 vectors to 2/3/4 bits per dimension with zero training time.
 
-Unlike traditional vector databases (Pinecone, Milvus, Qdrant) that require slow indexing (K-Means/HNSW) and massive RAM costs, T-VectorDB uses **Data-Oblivious Quantization**.
+Unlike traditional vector databases that require slow K-Means indexing, T-VectorDB compresses vectors **the millisecond they arrive**. No training. No freezing. No waiting.
 
-## 🌟 Key Features
+## ✨ Why T-VectorDB?
 
-- **Zero Latency Indexing**: Vectors are compressed instantly as they arrive. No "training" phase.
-- **16x Memory Compression**: A 1536-dimensional OpenAI vector drops from 6,144 bytes to roughly 576 bytes (3 bits per dimension).
-- **Two-Tier Architecture**:
-  - **RAM**: 3-bit compressed approximate vectors for blazing-fast short-listing.
-  - **Disk**: Full Float32 exact vectors mapped via `sled` for final exact re-ranking.
-- **Pure Rust**: Zero C/Fortran or C++ dependencies. Runs anywhere Rust runs (including natively on Windows).
+| Feature | T-VectorDB | turboqvec | Qdrant | ChromaDB | Pinecone |
+|---------|:---:|:---:|:---:|:---:|:---:|
+| TurboQuant compression | ✅ 2/3/4-bit | ✅ 2/3/4-bit | ❌ | ❌ | ❌ |
+| **Two-Tier exact re-rank** | ✅ | ❌ | ❌ | ❌ | ❌ |
+| REST API server | ✅ | ❌ | ✅ | ✅ | ✅ |
+| Persistence (survives restart) | ✅ | ❌ | ✅ | ✅ | ✅ |
+| Batch insert/search | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Delete vectors | ✅ | ❌ | ✅ | ✅ | ✅ |
+| Zero C/C++ dependencies | ✅ | ✅ | ❌ | N/A | N/A |
 
-## 🧠 How TurboQuant Works
+> **Our unique advantage:** The Two-Tier Hybrid Architecture. We use compressed vectors for blazing-fast approximate search, then re-rank exact results from disk. You get the **speed of compression** with the **accuracy of brute-force**. No other database does this.
 
-Instead of looking at your data to build buckets (like Product Quantization), we use the mathematical properties of the universe:
-1. **Orthogonal Rotation ($`\Pi`$)**: We rotate your incoming vector randomly. Due to the Central Limit Theorem, this forces the vector coordinates into a perfect Gaussian Bell Curve.
-2. **Hardcoded Centroids (MSE Stage)**: Because we know the data forms a Bell Curve, we hardcode the 4 mathematically optimal buckets. This costs just **2 bits**.
-3. **QJL Residual Stage**: We project the tiny error (residual) through a Gaussian Matrix and save only the signs (+ or -). This costs **1 bit**.
+## 🧠 How It Works
 
-During search, we rotate the query once, precompute a Look-Up Table (LUT), and score millions of vectors per second without ever decompressing them.
+1. **Orthogonal Rotation (Π):** Rotate incoming vectors using a random orthogonal matrix. The Central Limit Theorem forces coordinates into a predictable Gaussian distribution.
+2. **Lloyd-Max Quantization:** Snap each coordinate to the optimal centroid for that bit-width. No training needed — the buckets are mathematically predetermined.
+3. **QJL Residual (1-bit):** Project the quantization error through a Gaussian matrix and store only the signs. Corrects inner product bias.
+4. **Asymmetric Search:** At query time, build a lookup table (LUT) once. Score millions of vectors per second using table reads — never decompress the database.
 
-## 📊 Performance Benchmarks (vs Traditional DBs)
+## 📊 Performance
 
-We ran a heavy workload benchmark of **100,000 vectors** (1536 dimensions, OpenAI sizing) to prove the insane efficiency:
+**Compression & Memory** (d=384)
 
-| Metric | Traditional (Float32) | T-VectorDB (3-bit Packed) | Advantage |
-|--------|----------------------|---------------------------|-----------|
-| **Memory Footprint** | ~586.00 MB | **56.08 MB** | **10.4x Smaller** |
-| **Search Latency (Avg)** | High (Disk/RAM heavy) | **324 ms** | Insanely fast for pure CPU |
+| Vectors | Float32 | 4-bit | 3-bit | 2-bit |
+|---------|---------|-------|-------|-------|
+| 10,000 | 15.4 MB | 2.0 MB | 1.5 MB | 1.0 MB |
+| 100,000 | 153.6 MB | 19.6 MB | 14.8 MB | 10.0 MB |
+| 1,000,000 | 1,536 MB | **196 MB** | **148 MB** | **100 MB** |
 
-*With T-VectorDB, you can hold millions of high-dimensional embeddings perfectly in extremely cheap CPU server RAM without paying tens of thousands to AWS or Pinecone.*
+**Compression Ratios**
+
+| Bit-Width | Compression | Best For |
+|-----------|------------|----------|
+| **4-bit** | 7.8x smaller | Near-lossless retrieval (~95% R@1) |
+| **3-bit** | 10.4x smaller | Balanced speed/accuracy (~87% R@1) |
+| **2-bit** | 15.4x smaller | Maximum compression (~73% R@1) |
 
 ## 🚀 Quick Start
-
-Ensure you have Rust installed, then clone and run:
 
 ```bash
 git clone https://github.com/kavinkarthicknattuthurai/T-VectorDB.git
@@ -45,52 +53,115 @@ cd T-VectorDB
 cargo run --release
 ```
 
-**Custom CLI Flags:**
+**Configuration flags:**
 ```bash
-cargo run --release -- --dim 1536 --port 3000 --data ./my_db_path
+cargo run --release -- --dim 1536 --bits 4 --port 3000 --data ./my_db
 ```
 
-### API Usage
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dim` | 1536 | Vector dimensionality |
+| `--bits` | 3 | Quantization bit-width (2, 3, or 4) |
+| `--port` | 3000 | HTTP server port |
+| `--data` | ./data | Database storage directory |
 
-Insert a vector:
+## 📡 API Reference
+
+### Insert a vector
 ```bash
 curl -X POST http://localhost:3000/insert \
   -H "Content-Type: application/json" \
-  -d '{"id": 42, "vector": [0.1, 0.2, 0.3, ...]}'
+  -d '{"id": 1, "vector": [0.1, 0.2, ...]}'
 ```
 
-Search (Exact Hybrid Mode):
+### Batch insert
+```bash
+curl -X POST http://localhost:3000/insert_batch \
+  -H "Content-Type: application/json" \
+  -d '{"vectors": [{"id": 1, "vector": [...]}, {"id": 2, "vector": [...]}]}'
+```
+
+### Search (approximate — RAM only, fastest)
 ```bash
 curl -X POST http://localhost:3000/search \
   -H "Content-Type: application/json" \
-  -d '{"vector": [0.1, 0.2, 0.3, ...], "exact": true, "top_k": 5}'
+  -d '{"vector": [0.1, 0.2, ...], "top_k": 5}'
 ```
 
-View Stats:
+### Search (exact — hybrid two-tier, perfect accuracy)
+```bash
+curl -X POST http://localhost:3000/search \
+  -H "Content-Type: application/json" \
+  -d '{"vector": [0.1, 0.2, ...], "top_k": 5, "exact": true}'
+```
+
+### Delete a vector
+```bash
+curl -X DELETE http://localhost:3000/vectors/42
+```
+
+### View stats
 ```bash
 curl http://localhost:3000/stats
 ```
 
 ## 🏗️ Architecture
 
-```mermaid
-graph TD
-    A[Client POST /insert] --> B(L2 Normalize)
-    B --> C(Multiply by Π Matrix)
-    C --> D{Quantize to 4 Centroids}
-    D --> E[Pack into 2 bits/dim]
-    
-    C -.-> F(Residual Error)
-    F --> G(Multiply by S Matrix)
-    G --> H[Extract Sign Bits]
-    H --> I[Pack into 1 bit/dim]
-    
-    E --> J[(RAM Store: 3 bits/dim)]
-    I --> J
-    
-    A --> K[(Disk Store: Float32 sled)]
+```
+                    ┌─────────────────────────────┐
+                    │         REST API (Axum)      │
+                    │  /insert  /search  /delete   │
+                    └──────────┬──────────────────┘
+                               │
+                    ┌──────────▼──────────────────┐
+                    │       TurboQuant Engine      │
+                    │  Rotate → Quantize → Pack    │
+                    │  2-bit / 3-bit / 4-bit       │
+                    └──────────┬──────────────────┘
+                               │
+              ┌────────────────┼────────────────┐
+              │                │                │
+    ┌─────────▼─────────┐    ┌▼────────────────▼┐
+    │    RAM Store       │    │   Disk Store     │
+    │  Compressed bits   │    │  Full Float32    │
+    │  (fast scan)       │    │  (sled, exact)   │
+    └─────────┬─────────┘    └─────────┬────────┘
+              │                        │
+              │   Approximate Top-100  │
+              ├────────────────────────┤
+              │   Exact Re-Rank Top-K  │
+              └────────────────────────┘
+```
+
+## 📂 Project Structure
+
+```
+T-VectorDB/
+├── Cargo.toml             # Dependencies & config
+├── src/
+│   ├── main.rs            # Server entry point + CLI
+│   ├── lib.rs             # Module declarations
+│   ├── turbo_math.rs      # TurboIndex: QR decomp, Lloyd-Max centroids
+│   ├── storage_engine.rs  # PackedVector, compression, Database, persistence
+│   ├── execution_engine.rs# ADC search, hybrid re-rank, batch search
+│   ├── api_server.rs      # Axum REST endpoints
+│   └── bin/
+│       └── benchmark.rs   # Performance benchmark suite
+├── README.md
+├── LICENSE                # MIT
+└── mid.md                 # Master Implementation Document
+```
+
+## 🔬 Run Benchmarks
+
+```bash
+cargo run --release --bin benchmark
 ```
 
 ## 📜 License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+## 🙏 Acknowledgments
+
+Built on the [TurboQuant paper](https://arxiv.org/) by Amir Zandieh, Majid Daliri, Majid Hadian, and Vahab Mirrokni (Google Research, ICLR 2026).

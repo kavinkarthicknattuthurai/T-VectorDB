@@ -1,17 +1,22 @@
-//! # REST API Server — Axum HTTP Endpoints for T-VectorDB
+//! # REST API Server V2 — Full-Featured HTTP Endpoints
 //!
-//! Provides two endpoints:
-//! - `POST /insert` — Insert a vector with an ID
-//! - `POST /search` — Search for similar vectors (approximate or exact)
+//! Endpoints:
+//! - `GET  /`          — Health check
+//! - `GET  /stats`     — Database statistics + memory footprint
+//! - `POST /insert`    — Insert a single vector
+//! - `POST /insert_batch` — Insert multiple vectors
+//! - `POST /search`    — Search (approximate or exact hybrid)
+//! - `POST /search_batch` — Multiple queries at once
+//! - `DELETE /vectors/{id}` — Delete a vector
 
-use crate::execution_engine::{hybrid_search, search_ram_store};
+use crate::execution_engine::{batch_search, hybrid_search, search_ram_store};
 use crate::storage_engine::Database;
 use crate::turbo_math::TurboIndex;
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -21,7 +26,6 @@ use std::sync::{Arc, RwLock};
 // Application State
 // ============================================================================
 
-/// Shared application state, safe for concurrent access.
 pub struct AppState {
     pub db: RwLock<Database>,
     pub index: TurboIndex,
@@ -45,6 +49,18 @@ pub struct InsertResponse {
 }
 
 #[derive(Deserialize)]
+pub struct BatchInsertRequest {
+    pub vectors: Vec<InsertRequest>,
+}
+
+#[derive(Serialize)]
+pub struct BatchInsertResponse {
+    pub success: bool,
+    pub inserted: usize,
+    pub total_vectors: usize,
+}
+
+#[derive(Deserialize)]
 pub struct SearchRequest {
     pub vector: Vec<f32>,
     #[serde(default)]
@@ -53,8 +69,13 @@ pub struct SearchRequest {
     pub top_k: usize,
 }
 
-fn default_top_k() -> usize {
-    5
+fn default_top_k() -> usize { 5 }
+
+#[derive(Deserialize)]
+pub struct BatchSearchRequest {
+    pub vectors: Vec<Vec<f32>>,
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
 }
 
 #[derive(Serialize)]
@@ -71,127 +92,176 @@ pub struct SearchResponse {
 }
 
 #[derive(Serialize)]
+pub struct BatchSearchResponse {
+    pub results: Vec<Vec<SearchResult>>,
+    pub total_vectors: usize,
+}
+
+#[derive(Serialize)]
 pub struct StatsResponse {
     pub total_vectors: usize,
     pub dimension: usize,
+    pub bit_width: usize,
     pub compression_ratio: String,
+    pub ram_memory_bytes: usize,
+    pub ram_memory_mb: f64,
     pub version: String,
+}
+
+#[derive(Serialize)]
+pub struct DeleteResponse {
+    pub success: bool,
+    pub deleted: bool,
+    pub id: u64,
 }
 
 // ============================================================================
 // Handlers
 // ============================================================================
 
-/// Health check endpoint.
 async fn health() -> &'static str {
     "T-VectorDB is running 🚀"
 }
 
-/// GET /stats — Database statistics.
 async fn stats(State(state): State<Arc<AppState>>) -> Json<StatsResponse> {
     let db = state.db.read().unwrap();
+    let mem = db.memory_bytes();
     Json(StatsResponse {
         total_vectors: db.len(),
         dimension: state.index.d,
-        compression_ratio: "16:1 (Float32 → 3-bit)".to_string(),
+        bit_width: state.index.bits.bits(),
+        compression_ratio: format!("{:.1}x", state.index.bits.compression_ratio()),
+        ram_memory_bytes: mem,
+        ram_memory_mb: mem as f64 / 1_048_576.0,
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
 }
 
-/// POST /insert — Insert a vector into the database.
-async fn insert(
+async fn insert_one(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<InsertRequest>,
 ) -> Result<Json<InsertResponse>, (StatusCode, String)> {
-    // Validate dimension
     if payload.vector.len() != state.index.d {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Dimension mismatch: expected {}, got {}",
-                state.index.d,
-                payload.vector.len()
-            ),
-        ));
+        return Err((StatusCode::BAD_REQUEST, format!(
+            "Dimension mismatch: expected {}, got {}", state.index.d, payload.vector.len()
+        )));
     }
 
-    // Acquire write lock and insert
     let mut db = state.db.write().unwrap();
     match db.insert(&state.index, &payload.vector, payload.id) {
-        Ok(()) => {
-            tracing::info!("Inserted vector id={}, total={}", payload.id, db.len());
-            Ok(Json(InsertResponse {
-                success: true,
-                message: format!("Vector {} inserted successfully", payload.id),
-                id: payload.id,
-            }))
-        }
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to insert: {}", e),
-        )),
+        Ok(()) => Ok(Json(InsertResponse {
+            success: true,
+            message: format!("Vector {} inserted ({})", payload.id, state.index.bits.bits()),
+            id: payload.id,
+        })),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Insert failed: {}", e))),
     }
 }
 
-/// POST /search — Search for similar vectors.
+async fn insert_batch(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<BatchInsertRequest>,
+) -> Result<Json<BatchInsertResponse>, (StatusCode, String)> {
+    // Validate all dimensions
+    for req in &payload.vectors {
+        if req.vector.len() != state.index.d {
+            return Err((StatusCode::BAD_REQUEST, format!(
+                "Vector {} dimension mismatch: expected {}, got {}",
+                req.id, state.index.d, req.vector.len()
+            )));
+        }
+    }
+
+    let pairs: Vec<(u64, Vec<f32>)> = payload.vectors
+        .into_iter()
+        .map(|r| (r.id, r.vector))
+        .collect();
+
+    let mut db = state.db.write().unwrap();
+    match db.insert_batch(&state.index, &pairs) {
+        Ok(count) => Ok(Json(BatchInsertResponse {
+            success: true,
+            inserted: count,
+            total_vectors: db.len(),
+        })),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Batch insert failed: {}", e))),
+    }
+}
+
 async fn search(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, (StatusCode, String)> {
-    // Validate dimension
     if payload.vector.len() != state.index.d {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Dimension mismatch: expected {}, got {}",
-                state.index.d,
-                payload.vector.len()
-            ),
-        ));
+        return Err((StatusCode::BAD_REQUEST, format!(
+            "Dimension mismatch: expected {}, got {}", state.index.d, payload.vector.len()
+        )));
     }
 
     let db = state.db.read().unwrap();
-
     if db.is_empty() {
-        return Ok(Json(SearchResponse {
-            results: vec![],
-            total_vectors: 0,
-            mode: "empty".to_string(),
-        }));
+        return Ok(Json(SearchResponse { results: vec![], total_vectors: 0, mode: "empty".into() }));
     }
 
     let (results, mode) = if payload.exact {
-        // Two-tier hybrid search: RAM shortlist → exact disk re-rank
-        let r = hybrid_search(&db, &state.index, &payload.vector, payload.top_k);
-        (r, "exact (hybrid)")
+        (hybrid_search(&db, &state.index, &payload.vector, payload.top_k), "exact (hybrid)")
     } else {
-        // Fast approximate search over compressed RAM store only
-        let r = search_ram_store(&state.index, &db.ram, &payload.vector, payload.top_k);
-        (r, "approximate (RAM-only)")
+        (search_ram_store(&state.index, &db.ram, &payload.vector, payload.top_k), "approximate")
     };
 
-    let search_results: Vec<SearchResult> = results
-        .into_iter()
-        .map(|(id, score)| SearchResult { id, score })
-        .collect();
-
     Ok(Json(SearchResponse {
-        results: search_results,
+        results: results.into_iter().map(|(id, score)| SearchResult { id, score }).collect(),
         total_vectors: db.len(),
         mode: mode.to_string(),
     }))
+}
+
+async fn search_batch_handler(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<BatchSearchRequest>,
+) -> Result<Json<BatchSearchResponse>, (StatusCode, String)> {
+    for (i, v) in payload.vectors.iter().enumerate() {
+        if v.len() != state.index.d {
+            return Err((StatusCode::BAD_REQUEST, format!(
+                "Query {} dimension mismatch: expected {}, got {}", i, state.index.d, v.len()
+            )));
+        }
+    }
+
+    let db = state.db.read().unwrap();
+    let all_results = batch_search(&state.index, &db.ram, &payload.vectors, payload.top_k);
+
+    Ok(Json(BatchSearchResponse {
+        results: all_results.into_iter().map(|results| {
+            results.into_iter().map(|(id, score)| SearchResult { id, score }).collect()
+        }).collect(),
+        total_vectors: db.len(),
+    }))
+}
+
+async fn delete_vector(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u64>,
+) -> Result<Json<DeleteResponse>, (StatusCode, String)> {
+    let mut db = state.db.write().unwrap();
+    match db.delete(id) {
+        Ok(deleted) => Ok(Json(DeleteResponse { success: true, deleted, id })),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Delete failed: {}", e))),
+    }
 }
 
 // ============================================================================
 // Router
 // ============================================================================
 
-/// Build the Axum router with all endpoints.
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(health))
         .route("/stats", get(stats))
-        .route("/insert", post(insert))
+        .route("/insert", post(insert_one))
+        .route("/insert_batch", post(insert_batch))
         .route("/search", post(search))
+        .route("/search_batch", post(search_batch_handler))
+        .route("/vectors/{id}", delete(delete_vector))
         .with_state(state)
 }

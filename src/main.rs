@@ -1,12 +1,9 @@
-//! # T-VectorDB — Zero-Latency, 16x Compressed Vector Database
-//!
-//! Built on the TurboQuant paper (ICLR 2026, Google Research).
-//! Compresses Float32 vectors to 3 bits per dimension with zero training time.
+//! # T-VectorDB V2 — Zero-Latency, Configurable Compressed Vector Database
 //!
 //! Usage:
-//!   cargo run                  # Starts server on 0.0.0.0:3000 with d=1536
-//!   cargo run -- --dim 768     # Custom dimension
-//!   cargo run -- --port 8080   # Custom port
+//!   cargo run --release                       # d=1536, 3-bit, port 3000
+//!   cargo run --release -- --dim 384 --bits 4 # 384-dim, 4-bit (near-lossless)
+//!   cargo run --release -- --bits 2           # 2-bit (maximum compression)
 
 use std::sync::{Arc, RwLock};
 
@@ -15,9 +12,21 @@ mod storage_engine;
 mod execution_engine;
 mod api_server;
 
-use turbo_math::TurboIndex;
+use turbo_math::{BitWidth, TurboIndex};
 use storage_engine::Database;
 use api_server::{AppState, create_router};
+
+fn parse_bitwidth(s: &str) -> BitWidth {
+    match s {
+        "2" => BitWidth::Bits2,
+        "3" => BitWidth::Bits3,
+        "4" => BitWidth::Bits4,
+        _ => {
+            eprintln!("Invalid bit-width '{}'. Must be 2, 3, or 4. Defaulting to 3.", s);
+            BitWidth::Bits3
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -27,12 +36,18 @@ async fn main() {
         .with_level(true)
         .init();
 
-    // Configuration (could be extended with clap for CLI args)
+    // Parse CLI arguments
     let dimension: usize = std::env::args()
         .position(|a| a == "--dim")
         .and_then(|i| std::env::args().nth(i + 1))
         .and_then(|s| s.parse().ok())
         .unwrap_or(1536);
+
+    let bits: BitWidth = std::env::args()
+        .position(|a| a == "--bits")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .map(|s| parse_bitwidth(&s))
+        .unwrap_or(BitWidth::Bits3);
 
     let port: u16 = std::env::args()
         .position(|a| a == "--port")
@@ -45,7 +60,7 @@ async fn main() {
         .and_then(|i| std::env::args().nth(i + 1))
         .unwrap_or_else(|| "./data".to_string());
 
-    // --- Banner ---
+    // Banner
     println!();
     println!("  ╔══════════════════════════════════════════════════════════╗");
     println!("  ║                                                          ║");
@@ -56,47 +71,47 @@ async fn main() {
     println!("  ║      ██║      ╚████╔╝ ███████╗╚██████╗   ██║   ██████╔╝  ║");
     println!("  ║      ╚═╝       ╚═══╝  ╚══════╝ ╚═════╝   ╚═╝   ╚═════╝  ║");
     println!("  ║                                                          ║");
-    println!("  ║   Zero-Latency · 16x Compressed · LLM-Native VectorDB   ║");
+    println!("  ║   Zero-Latency · Configurable · LLM-Native VectorDB     ║");
     println!("  ║   Built on TurboQuant (ICLR 2026, Google Research)       ║");
     println!("  ║                                                          ║");
     println!("  ╚══════════════════════════════════════════════════════════╝");
     println!();
 
-    // --- Initialize TurboIndex ---
-    tracing::info!("Initializing TurboIndex with dimension d={}...", dimension);
+    // Initialize TurboIndex
+    tracing::info!("Initializing TurboIndex: d={}, bits={}, compression={:.1}x ...",
+        dimension, bits.bits(), bits.compression_ratio());
     let start = std::time::Instant::now();
-    let index = TurboIndex::new(dimension);
+    let index = TurboIndex::new(dimension, bits);
     let init_time = start.elapsed();
     tracing::info!("TurboIndex ready in {:.2?}", init_time);
 
-    // --- Initialize Database ---
+    // Initialize Database (with persistence)
     tracing::info!("Opening database at: {}", data_dir);
     let db = Database::new(&data_dir).expect("Failed to open database");
-    tracing::info!("Database ready. Vectors in RAM: {}", db.len());
+    tracing::info!("Database ready. Vectors loaded: {}", db.len());
 
-    // --- Build shared state ---
+    // Build shared state
     let state = Arc::new(AppState {
         db: RwLock::new(db),
         index,
     });
 
-    // --- Start HTTP server ---
+    // Start server
     let addr = format!("0.0.0.0:{}", port);
-    tracing::info!("Starting HTTP server on {}", addr);
-
     let router = create_router(state);
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .expect("Failed to bind address");
+    let listener = tokio::net::TcpListener::bind(&addr).await.expect("Failed to bind");
 
     println!();
-    println!("  🚀 T-VectorDB is live at http://localhost:{}", port);
-    println!("  📊 Stats:          GET  http://localhost:{}/stats", port);
-    println!("  📥 Insert vector:  POST http://localhost:{}/insert", port);
-    println!("  🔍 Search:         POST http://localhost:{}/search", port);
+    println!("  🚀 T-VectorDB v{} is live!", env!("CARGO_PKG_VERSION"));
+    println!("  ⚙️  Config: d={}, {}-bit, {:.1}x compression", dimension, bits.bits(), bits.compression_ratio());
+    println!();
+    println!("  📊 Stats:            GET    http://localhost:{}/stats", port);
+    println!("  📥 Insert:           POST   http://localhost:{}/insert", port);
+    println!("  📥 Batch Insert:     POST   http://localhost:{}/insert_batch", port);
+    println!("  🔍 Search:           POST   http://localhost:{}/search", port);
+    println!("  🔍 Batch Search:     POST   http://localhost:{}/search_batch", port);
+    println!("  🗑️  Delete:           DELETE http://localhost:{}/vectors/{{id}}", port);
     println!();
 
-    axum::serve(listener, router)
-        .await
-        .expect("Server crashed");
+    axum::serve(listener, router).await.expect("Server crashed");
 }
