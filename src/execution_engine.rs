@@ -14,12 +14,24 @@ type ScoredItem = Reverse<(OrderedFloat<f32>, u64)>;
 
 /// Perform approximate search over the compressed RAM store using ADC.
 ///
-/// Works with any bit-width: the LUT is sized to the number of quantization levels.
+/// Uses MSE-only scoring by default (best for normalized embeddings).
+/// Set `use_qjl=true` for KV cache / attention vectors where QJL correction helps.
 pub fn search_ram_store(
     index: &TurboIndex,
     db: &[PackedVector],
     query: &[f32],
     top_k: usize,
+) -> Vec<(u64, f32)> {
+    search_ram_store_with_options(index, db, query, top_k, false)
+}
+
+/// Search with explicit QJL control.
+pub fn search_ram_store_with_options(
+    index: &TurboIndex,
+    db: &[PackedVector],
+    query: &[f32],
+    top_k: usize,
+    use_qjl: bool,
 ) -> Vec<(u64, f32)> {
     let d = index.d;
     assert_eq!(query.len(), d, "Query dimension mismatch");
@@ -41,13 +53,11 @@ pub fn search_ram_store(
         }
     }
 
-    // Step 3: Project query for QJL
-    let q_qjl = &index.s * &q;
-
-    // Precompute QJL scaling factor
+    // Optional: Project query for QJL
+    let q_qjl = if use_qjl { Some(&index.s * &q) } else { None };
     let qjl_scale_base = (std::f32::consts::PI / (2.0 * d as f32)).sqrt();
 
-    // Step 4: Score every vector
+    // Step 3: Score every vector
     let mut heap: BinaryHeap<ScoredItem> = BinaryHeap::with_capacity(top_k + 1);
 
     for packed in db.iter() {
@@ -60,22 +70,28 @@ pub fn search_ram_store(
             mse_score += lut[i][idx as usize];
         }
 
-        // QJL Score via sign bits
-        let mut qjl_score: f32 = 0.0;
-        let mut bit_idx = 0;
-        for &byte in packed.qjl_bits.iter() {
-            let signs = unpack_qjl_byte(byte);
-            for &sign in signs.iter() {
-                if bit_idx < d {
-                    let sign_val = 2.0 * sign as f32 - 1.0;
-                    qjl_score += sign_val * q_qjl[bit_idx];
-                    bit_idx += 1;
+        // QJL correction (optional — only helps for non-normalized vectors)
+        let final_score = if use_qjl {
+            if let Some(ref q_proj) = q_qjl {
+                let mut qjl_score: f32 = 0.0;
+                let mut bit_idx = 0;
+                for &byte in packed.qjl_bits.iter() {
+                    let signs = unpack_qjl_byte(byte);
+                    for &sign in signs.iter() {
+                        if bit_idx < d {
+                            let sign_val = 2.0 * sign as f32 - 1.0;
+                            qjl_score += sign_val * q_proj[bit_idx];
+                            bit_idx += 1;
+                        }
+                    }
                 }
+                mse_score + packed.residual_norm * qjl_scale_base * qjl_score
+            } else {
+                mse_score
             }
-        }
-
-        // Final Score
-        let final_score = mse_score + packed.residual_norm * qjl_scale_base * qjl_score;
+        } else {
+            mse_score
+        };
 
         // Min-heap top-k
         if heap.len() < top_k {
