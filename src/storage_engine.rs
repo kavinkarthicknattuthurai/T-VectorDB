@@ -170,6 +170,8 @@ pub fn compress_vector(index: &TurboIndex, vector: &[f32], id: u64) -> PackedVec
 // Database (RAM + Disk + Persistence)
 // ============================================================================
 
+use std::sync::RwLock;
+
 /// Two-tier database with persistence.
 ///
 /// - RAM: Compressed vectors for fast approximate search
@@ -177,8 +179,8 @@ pub fn compress_vector(index: &TurboIndex, vector: &[f32], id: u64) -> PackedVec
 /// - Persistence: Compressed vectors are also saved to a sled tree,
 ///   and reloaded into RAM on startup
 pub struct Database {
-    /// Tier 1: Compressed vectors in RAM
-    pub ram: Vec<PackedVector>,
+    /// Tier 1: Compressed vectors in RAM (RwLock protected)
+    pub ram: RwLock<Vec<PackedVector>>,
 
     /// Tier 2: Full-precision Float32 vectors on disk
     pub disk: sled::Db,
@@ -205,59 +207,79 @@ impl Database {
         }
         tracing::info!("Database opened at: {} ({} vectors)", path, ram.len());
 
-        Ok(Database { ram, disk })
+        Ok(Database { ram: RwLock::new(ram), disk })
     }
 
-    /// Insert a vector into both tiers.
+    /// Insert a vector into both tiers. Mathematical compression and disk I/O are
+    /// lock-free. Only pushing to RAM takes a brief Write lock.
     pub fn insert(
-        &mut self,
+        &self,
         index: &TurboIndex,
         vector: &[f32],
         id: u64,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Tier 1: Compress and store in RAM
+        // Step 1: Compress (CPU only, no locks)
         let packed = compress_vector(index, vector, id);
 
-        // Persist the compressed vector
+        // Step 2: Persist compressed vector to disk
         let compressed_tree = self.disk.open_tree("compressed")?;
         let serialized = serde_json::to_vec(&packed)?;
         compressed_tree.insert(id.to_be_bytes(), serialized)?;
 
-        self.ram.push(packed);
-
-        // Tier 2: Store raw float bytes
+        // Step 3: Insert raw vector to disk
         let key = id.to_be_bytes();
         let value: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
         self.disk.insert(key, value)?;
 
+        // Step 4: Add to RAM (Brief lock)
+        self.ram.write().unwrap().push(packed);
+
         Ok(())
     }
 
-    /// Insert a batch of vectors. Returns the number successfully inserted.
+    /// Insert a batch of vectors.
     pub fn insert_batch(
-        &mut self,
+        &self,
         index: &TurboIndex,
         vectors: &[(u64, Vec<f32>)],
     ) -> Result<usize, Box<dyn std::error::Error>> {
         let mut count = 0;
+        let mut new_packed = Vec::with_capacity(vectors.len());
+
+        // Process all math and disk IO completely lock free first
+        let compressed_tree = self.disk.open_tree("compressed")?;
+        
         for (id, vector) in vectors {
-            self.insert(index, vector, *id)?;
+            let packed = compress_vector(index, vector, *id);
+            let serialized = serde_json::to_vec(&packed)?;
+            compressed_tree.insert(id.to_be_bytes(), serialized)?;
+            
+            let key = id.to_be_bytes();
+            let value: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
+            self.disk.insert(key, value)?;
+            
+            new_packed.push(packed);
             count += 1;
         }
+
+        // Apply to RAM all at once
+        self.ram.write().unwrap().extend(new_packed);
+
         Ok(count)
     }
 
     /// Delete a vector by ID from both RAM and disk.
-    pub fn delete(&mut self, id: u64) -> Result<bool, Box<dyn std::error::Error>> {
-        let original_len = self.ram.len();
-        self.ram.retain(|v| v.id != id);
-        let removed = self.ram.len() < original_len;
+    pub fn delete(&self, id: u64) -> Result<bool, Box<dyn std::error::Error>> {
+        // Disk delete
+        self.disk.remove(id.to_be_bytes())?;
+        let compressed_tree = self.disk.open_tree("compressed")?;
+        compressed_tree.remove(id.to_be_bytes())?;
 
-        if removed {
-            self.disk.remove(id.to_be_bytes())?;
-            let compressed_tree = self.disk.open_tree("compressed")?;
-            compressed_tree.remove(id.to_be_bytes())?;
-        }
+        // RAM delete
+        let mut ram = self.ram.write().unwrap();
+        let original_len = ram.len();
+        ram.retain(|v| v.id != id);
+        let removed = ram.len() < original_len;
 
         Ok(removed)
     }
@@ -282,11 +304,11 @@ impl Database {
 
     /// Total compressed memory footprint in bytes.
     pub fn memory_bytes(&self) -> usize {
-        self.ram.iter().map(|v| v.size_bytes()).sum()
+        self.ram.read().unwrap().iter().map(|v| v.size_bytes()).sum()
     }
 
-    pub fn len(&self) -> usize { self.ram.len() }
-    pub fn is_empty(&self) -> bool { self.ram.is_empty() }
+    pub fn len(&self) -> usize { self.ram.read().unwrap().len() }
+    pub fn is_empty(&self) -> bool { self.ram.read().unwrap().is_empty() }
 }
 
 // ============================================================================

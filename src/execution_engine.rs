@@ -120,7 +120,11 @@ pub fn hybrid_search(
     top_k: usize,
 ) -> Vec<(u64, f32)> {
     let shortlist_size = 100.min(db.len());
-    let shortlist = search_ram_store(index, &db.ram, query, shortlist_size);
+    
+    // Acquire temporary read lock to scan RAM
+    let ram_guard = db.ram.read().unwrap();
+    let shortlist = search_ram_store(index, &ram_guard, query, shortlist_size);
+    drop(ram_guard);
 
     let mut q = DVector::from_column_slice(query);
     let q_norm = q.norm();

@@ -27,7 +27,7 @@ use std::sync::{Arc, RwLock};
 // ============================================================================
 
 pub struct AppState {
-    pub db: RwLock<Database>,
+    pub db: Database,
     pub index: TurboIndex,
 }
 
@@ -124,10 +124,9 @@ async fn health() -> &'static str {
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> Json<StatsResponse> {
-    let db = state.db.read().unwrap();
-    let mem = db.memory_bytes();
+    let mem = state.db.memory_bytes();
     Json(StatsResponse {
-        total_vectors: db.len(),
+        total_vectors: state.db.len(),
         dimension: state.index.d,
         bit_width: state.index.bits.bits(),
         compression_ratio: format!("{:.1}x", state.index.bits.compression_ratio()),
@@ -147,8 +146,7 @@ async fn insert_one(
         )));
     }
 
-    let mut db = state.db.write().unwrap();
-    match db.insert(&state.index, &payload.vector, payload.id) {
+    match state.db.insert(&state.index, &payload.vector, payload.id) {
         Ok(()) => Ok(Json(InsertResponse {
             success: true,
             message: format!("Vector {} inserted ({})", payload.id, state.index.bits.bits()),
@@ -177,12 +175,11 @@ async fn insert_batch(
         .map(|r| (r.id, r.vector))
         .collect();
 
-    let mut db = state.db.write().unwrap();
-    match db.insert_batch(&state.index, &pairs) {
+    match state.db.insert_batch(&state.index, &pairs) {
         Ok(count) => Ok(Json(BatchInsertResponse {
             success: true,
             inserted: count,
-            total_vectors: db.len(),
+            total_vectors: state.db.len(),
         })),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Batch insert failed: {}", e))),
     }
@@ -198,20 +195,21 @@ async fn search(
         )));
     }
 
-    let db = state.db.read().unwrap();
-    if db.is_empty() {
+    if state.db.is_empty() {
         return Ok(Json(SearchResponse { results: vec![], total_vectors: 0, mode: "empty".into() }));
     }
 
     let (results, mode) = if payload.exact {
-        (hybrid_search(&db, &state.index, &payload.vector, payload.top_k), "exact (hybrid)")
+        (hybrid_search(&state.db, &state.index, &payload.vector, payload.top_k), "exact (hybrid)")
     } else {
-        (search_ram_store(&state.index, &db.ram, &payload.vector, payload.top_k), "approximate")
+        let ram_guard = state.db.ram.read().unwrap();
+        let res = search_ram_store(&state.index, &ram_guard, &payload.vector, payload.top_k);
+        (res, "approximate")
     };
 
     Ok(Json(SearchResponse {
         results: results.into_iter().map(|(id, score)| SearchResult { id, score }).collect(),
-        total_vectors: db.len(),
+        total_vectors: state.db.len(),
         mode: mode.to_string(),
     }))
 }
@@ -228,14 +226,15 @@ async fn search_batch_handler(
         }
     }
 
-    let db = state.db.read().unwrap();
-    let all_results = batch_search(&state.index, &db.ram, &payload.vectors, payload.top_k);
+    let ram_guard = state.db.ram.read().unwrap();
+    let all_results = batch_search(&state.index, &ram_guard, &payload.vectors, payload.top_k);
+    drop(ram_guard);
 
     Ok(Json(BatchSearchResponse {
         results: all_results.into_iter().map(|results| {
             results.into_iter().map(|(id, score)| SearchResult { id, score }).collect()
         }).collect(),
-        total_vectors: db.len(),
+        total_vectors: state.db.len(),
     }))
 }
 
@@ -243,8 +242,7 @@ async fn delete_vector(
     State(state): State<Arc<AppState>>,
     Path(id): Path<u64>,
 ) -> Result<Json<DeleteResponse>, (StatusCode, String)> {
-    let mut db = state.db.write().unwrap();
-    match db.delete(id) {
+    match state.db.delete(id) {
         Ok(deleted) => Ok(Json(DeleteResponse { success: true, deleted, id })),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Delete failed: {}", e))),
     }

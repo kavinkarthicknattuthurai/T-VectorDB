@@ -92,7 +92,7 @@ async fn main() {
 
     // Build shared state
     let state = Arc::new(AppState {
-        db: RwLock::new(db),
+        db,
         index,
     });
 
