@@ -19,8 +19,10 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+/// Type alias for batch insert tuples: (id, vector, optional metadata)
+type VectorTuple = (u64, Vec<f32>, Option<std::collections::HashMap<String, String>>);
 
 // ============================================================================
 // Application State
@@ -75,33 +77,33 @@ pub struct SearchRequest {
 
 fn default_top_k() -> usize { 5 }
 
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
 pub struct BatchSearchRequest {
     pub vectors: Vec<Vec<f32>>,
     #[serde(default = "default_top_k")]
     pub top_k: usize,
 }
 
-#[derive(Serialize)]
+#[derive(serde::Serialize)]
 pub struct SearchResult {
     pub id: u64,
     pub score: f32,
 }
 
-#[derive(Serialize)]
+#[derive(serde::Serialize)]
 pub struct SearchResponse {
     pub results: Vec<SearchResult>,
     pub total_vectors: usize,
     pub mode: String,
 }
 
-#[derive(Serialize)]
+#[derive(serde::Serialize)]
 pub struct BatchSearchResponse {
     pub results: Vec<Vec<SearchResult>>,
     pub total_vectors: usize,
 }
 
-#[derive(Serialize)]
+#[derive(serde::Serialize)]
 pub struct StatsResponse {
     pub total_vectors: usize,
     pub dimension: usize,
@@ -112,7 +114,7 @@ pub struct StatsResponse {
     pub version: String,
 }
 
-#[derive(Serialize)]
+#[derive(serde::Serialize)]
 pub struct DeleteResponse {
     pub success: bool,
     pub deleted: bool,
@@ -175,7 +177,7 @@ async fn insert_batch(
         }
     }
 
-    let pairs: Vec<(u64, Vec<f32>, Option<std::collections::HashMap<String, String>>)> = payload.vectors
+    let pairs: Vec<VectorTuple> = payload.vectors
         .into_iter()
         .map(|r| {
             let meta = if r.metadata.is_empty() { None } else { Some(r.metadata) };
