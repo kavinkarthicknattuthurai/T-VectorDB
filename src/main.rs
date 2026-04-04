@@ -5,16 +5,19 @@
 //!   cargo run --release -- --dim 384 --bits 4 # 384-dim, 4-bit (near-lossless)
 //!   cargo run --release -- --bits 2           # 2-bit (maximum compression)
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 mod turbo_math;
 mod storage_engine;
 mod execution_engine;
 mod api_server;
+mod grpc_server;
 
 use turbo_math::{BitWidth, TurboIndex};
 use storage_engine::Database;
 use api_server::{AppState, create_router};
+use grpc_server::{TVectorService, pb::t_vector_server::TVectorServer};
+use tonic::transport::Server;
 
 fn parse_bitwidth(s: &str) -> BitWidth {
     match s {
@@ -49,11 +52,17 @@ async fn main() {
         .map(|s| parse_bitwidth(&s))
         .unwrap_or(BitWidth::Bits3);
 
-    let port: u16 = std::env::args()
+    let rest_port: u16 = std::env::args()
         .position(|a| a == "--port")
         .and_then(|i| std::env::args().nth(i + 1))
         .and_then(|s| s.parse().ok())
         .unwrap_or(3000);
+
+    let grpc_port: u16 = std::env::args()
+        .position(|a| a == "--grpc-port")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50051);
 
     let data_dir = std::env::args()
         .position(|a| a == "--data")
@@ -96,22 +105,40 @@ async fn main() {
         index,
     });
 
-    // Start server
-    let addr = format!("0.0.0.0:{}", port);
-    let router = create_router(state);
-    let listener = tokio::net::TcpListener::bind(&addr).await.expect("Failed to bind");
-
     println!();
     println!("  🚀 T-VectorDB v{} is live!", env!("CARGO_PKG_VERSION"));
     println!("  ⚙️  Config: d={}, {}-bit, {:.1}x compression", dimension, bits.bits(), bits.compression_ratio());
     println!();
-    println!("  📊 Stats:            GET    http://localhost:{}/stats", port);
-    println!("  📥 Insert:           POST   http://localhost:{}/insert", port);
-    println!("  📥 Batch Insert:     POST   http://localhost:{}/insert_batch", port);
-    println!("  🔍 Search:           POST   http://localhost:{}/search", port);
-    println!("  🔍 Batch Search:     POST   http://localhost:{}/search_batch", port);
-    println!("  🗑️  Delete:           DELETE http://localhost:{}/vectors/{{id}}", port);
+    println!("  [REST API] http://localhost:{}", rest_port);
+    println!("  📊 Stats:            GET    /stats");
+    println!("  📥 Insert:           POST   /insert");
+    println!("  🔍 Search:           POST   /search");
+    println!();
+    println!("  [gRPC BINDING] tcp://0.0.0.0:{}", grpc_port);
+    println!("  ⚡ Binary protocol active for extreme throughput.");
     println!();
 
-    axum::serve(listener, router).await.expect("Server crashed");
+    // 1. Start REST Server (Axum)
+    let rest_addr = format!("0.0.0.0:{}", rest_port);
+    let router = create_router(state.clone());
+    let rest_listener = tokio::net::TcpListener::bind(&rest_addr).await.expect("Failed to bind REST port");
+    
+    let rest_server = tokio::spawn(async move {
+        axum::serve(rest_listener, router).await.expect("REST Server crashed")
+    });
+
+    // 2. Start gRPC Server (Tonic)
+    let grpc_addr = format!("0.0.0.0:{}", grpc_port).parse().unwrap();
+    let tv_service = TVectorService { state };
+    
+    let grpc_server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(TVectorServer::new(tv_service))
+            .serve(grpc_addr)
+            .await
+            .expect("gRPC Server crashed");
+    });
+
+    // Wait for both servers (they run indefinitely)
+    let _ = tokio::try_join!(rest_server, grpc_server);
 }

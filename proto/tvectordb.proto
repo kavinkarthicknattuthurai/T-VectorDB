@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+package tvectordb;
+
+// The core service exposing T-VectorDB methods
+service TVector {
+    rpc Insert (InsertRequest) returns (InsertResponse) {}
+    rpc InsertBatch (BatchInsertRequest) returns (BatchInsertResponse) {}
+    
+    rpc Search (SearchRequest) returns (SearchResponse) {}
+    rpc SearchBatch (BatchSearchRequest) returns (BatchSearchResponse) {}
+    
+    rpc Delete (DeleteRequest) returns (DeleteResponse) {}
+}
+
+message Vector {
+    uint64 id = 1;
+    repeated float values = 2; // Packed by default in proto3 for extreme efficiency
+}
+
+message InsertRequest {
+    Vector vector = 1;
+}
+
+message InsertResponse {
+    bool success = 1;
+    string message = 2;
+    uint64 id = 3;
+}
+
+message BatchInsertRequest {
+    repeated Vector vectors = 1;
+}
+
+message BatchInsertResponse {
+    bool success = 1;
+    uint32 inserted = 2;
+    uint32 total_vectors = 3;
+}
+
+message SearchRequest {
+    repeated float query = 1;
+    bool exact = 2;       // If true, forces disk re-ranking (Two-Tier Hybrid Search)
+    uint32 top_k = 3;
+}
+
+message SearchResult {
+    uint64 id = 1;
+    float score = 2;
+}
+
+message SearchResponse {
+    repeated SearchResult results = 1;
+    uint32 total_vectors = 2;
+    string mode = 3;
+}
+
+message BatchSearchRequest {
+    repeated SearchQuery queries = 1;
+    uint32 top_k = 2;
+}
+
+message SearchQuery {
+    repeated float values = 1;
+}
+
+message BatchSearchResponse {
+    repeated SearchResponse batch_results = 1;
+    uint32 total_vectors = 2;
+}
+
+message DeleteRequest {
+    uint64 id = 1;
+}
+
+message DeleteResponse {
+    bool success = 1;
+    bool deleted = 2;
+    uint64 id = 3;
+}
