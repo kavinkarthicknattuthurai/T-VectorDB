@@ -16,6 +16,7 @@ service TVector {
 message Vector {
     uint64 id = 1;
     repeated float values = 2; // Packed by default in proto3 for extreme efficiency
+    map<string, string> metadata = 3;
 }
 
 message InsertRequest {
@@ -42,6 +43,7 @@ message SearchRequest {
     repeated float query = 1;
     bool exact = 2;       // If true, forces disk re-ranking (Two-Tier Hybrid Search)
     uint32 top_k = 3;
+    map<string, string> filter = 4; // Required match for metadata tags
 }
 
 message SearchResult {

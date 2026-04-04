@@ -20,7 +20,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 // ============================================================================
 // Application State
@@ -35,38 +35,42 @@ pub struct AppState {
 // Request / Response Types
 // ============================================================================
 
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
 pub struct InsertRequest {
     pub id: u64,
     pub vector: Vec<f32>,
+    #[serde(default)]
+    pub metadata: std::collections::HashMap<String, String>,
 }
 
-#[derive(Serialize)]
+#[derive(serde::Serialize)]
 pub struct InsertResponse {
     pub success: bool,
     pub message: String,
     pub id: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
 pub struct BatchInsertRequest {
     pub vectors: Vec<InsertRequest>,
 }
 
-#[derive(Serialize)]
+#[derive(serde::Serialize)]
 pub struct BatchInsertResponse {
     pub success: bool,
     pub inserted: usize,
     pub total_vectors: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
 pub struct SearchRequest {
     pub vector: Vec<f32>,
     #[serde(default)]
     pub exact: bool,
     #[serde(default = "default_top_k")]
     pub top_k: usize,
+    #[serde(default)]
+    pub filter: std::collections::HashMap<String, String>,
 }
 
 fn default_top_k() -> usize { 5 }
@@ -146,7 +150,9 @@ async fn insert_one(
         )));
     }
 
-    match state.db.insert(&state.index, &payload.vector, payload.id) {
+    let meta_opt = if payload.metadata.is_empty() { None } else { Some(&payload.metadata) };
+
+    match state.db.insert(&state.index, &payload.vector, payload.id, meta_opt) {
         Ok(()) => Ok(Json(InsertResponse {
             success: true,
             message: format!("Vector {} inserted ({})", payload.id, state.index.bits.bits()),
@@ -160,7 +166,6 @@ async fn insert_batch(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<BatchInsertRequest>,
 ) -> Result<Json<BatchInsertResponse>, (StatusCode, String)> {
-    // Validate all dimensions
     for req in &payload.vectors {
         if req.vector.len() != state.index.d {
             return Err((StatusCode::BAD_REQUEST, format!(
@@ -170,9 +175,12 @@ async fn insert_batch(
         }
     }
 
-    let pairs: Vec<(u64, Vec<f32>)> = payload.vectors
+    let pairs: Vec<(u64, Vec<f32>, Option<std::collections::HashMap<String, String>>)> = payload.vectors
         .into_iter()
-        .map(|r| (r.id, r.vector))
+        .map(|r| {
+            let meta = if r.metadata.is_empty() { None } else { Some(r.metadata) };
+            (r.id, r.vector, meta)
+        })
         .collect();
 
     match state.db.insert_batch(&state.index, &pairs) {
@@ -199,11 +207,13 @@ async fn search(
         return Ok(Json(SearchResponse { results: vec![], total_vectors: 0, mode: "empty".into() }));
     }
 
+    let valid_ids = state.db.get_filtered_ids(&payload.filter);
+
     let (results, mode) = if payload.exact {
-        (hybrid_search(&state.db, &state.index, &payload.vector, payload.top_k), "exact (hybrid)")
+        (hybrid_search(&state.db, &state.index, &payload.vector, payload.top_k, valid_ids.as_ref()), "exact (hybrid)")
     } else {
         let ram_guard = state.db.ram.read().unwrap();
-        let res = search_ram_store(&state.index, &ram_guard, &payload.vector, payload.top_k);
+        let res = search_ram_store(&state.index, &ram_guard, &payload.vector, payload.top_k, valid_ids.as_ref());
         (res, "approximate")
     };
 
@@ -227,7 +237,8 @@ async fn search_batch_handler(
     }
 
     let ram_guard = state.db.ram.read().unwrap();
-    let all_results = batch_search(&state.index, &ram_guard, &payload.vectors, payload.top_k);
+    // Batch Search in REST doesn't accept a global filter yet, so we pass None
+    let all_results = batch_search(&state.index, &ram_guard, &payload.vectors, payload.top_k, None);
     drop(ram_guard);
 
     Ok(Json(BatchSearchResponse {

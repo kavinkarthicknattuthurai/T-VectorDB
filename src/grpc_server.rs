@@ -41,7 +41,9 @@ impl TVector for TVectorService {
             )));
         }
 
-        match self.state.db.insert(&self.state.index, &vector.values, vector.id) {
+        let meta_opt = if vector.metadata.is_empty() { None } else { Some(&vector.metadata) };
+
+        match self.state.db.insert(&self.state.index, &vector.values, vector.id, meta_opt) {
             Ok(()) => Ok(Response::new(InsertResponse {
                 success: true,
                 message: "Inserted successfully".into(),
@@ -59,13 +61,14 @@ impl TVector for TVectorService {
         
         let mut pairs = Vec::with_capacity(req.vectors.len());
         for v in req.vectors {
+            let meta = if v.metadata.is_empty() { None } else { Some(v.metadata) };
             if v.values.len() != self.state.index.d {
                 return Err(Status::invalid_argument(format!(
                     "Vector {} dimension mismatch: expected {}, got {}",
                     v.id, self.state.index.d, v.values.len()
                 )));
             }
-            pairs.push((v.id, v.values));
+            pairs.push((v.id, v.values, meta));
         }
 
         match self.state.db.insert_batch(&self.state.index, &pairs) {
@@ -102,9 +105,11 @@ impl TVector for TVectorService {
 
         let top_k = if req.top_k == 0 { 5 } else { req.top_k as usize };
 
+        let valid_ids = self.state.db.get_filtered_ids(&req.filter);
+
         let (results, mode) = if req.exact {
             (
-                hybrid_search(&self.state.db, &self.state.index, &req.query, top_k),
+                hybrid_search(&self.state.db, &self.state.index, &req.query, top_k, valid_ids.as_ref()),
                 "exact (hybrid)",
             )
         } else {
@@ -115,6 +120,7 @@ impl TVector for TVectorService {
                 &req.query,
                 top_k,
                 false, // Disable QJL to prevent noise
+                valid_ids.as_ref(),
             );
             (res, "approximate")
         };
@@ -152,7 +158,8 @@ impl TVector for TVectorService {
         }
 
         let ram_guard = self.state.db.ram.read().unwrap();
-        let all_results = batch_search(&self.state.index, &ram_guard, &queries, top_k);
+        // gRPC batch search doesn't accept a global filter yet
+        let all_results = batch_search(&self.state.index, &ram_guard, &queries, top_k, None);
         drop(ram_guard);
 
         let batch_responses = all_results

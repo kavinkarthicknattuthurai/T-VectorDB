@@ -166,33 +166,30 @@ pub fn compress_vector(index: &TurboIndex, vector: &[f32], id: u64) -> PackedVec
     PackedVector { id, mse_packed, qjl_bits, residual_norm: gamma }
 }
 
-// ============================================================================
-// Database (RAM + Disk + Persistence)
-// ============================================================================
-
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
 /// Two-tier database with persistence.
 ///
 /// - RAM: Compressed vectors for fast approximate search
-/// - Disk (sled): Full-precision vectors for exact re-ranking
-/// - Persistence: Compressed vectors are also saved to a sled tree,
-///   and reloaded into RAM on startup
+/// - Inverted Index: Optional metadata string-matching
+/// - Disk (sled): Full-precision vectors and serialized metadata
 pub struct Database {
     /// Tier 1: Compressed vectors in RAM (RwLock protected)
     pub ram: RwLock<Vec<PackedVector>>,
+
+    /// Inverted Index mapping `key:value` to a set of Vector IDs
+    pub inverted_index: RwLock<HashMap<String, HashSet<u64>>>,
 
     /// Tier 2: Full-precision Float32 vectors on disk
     pub disk: sled::Db,
 }
 
 impl Database {
-    /// Create or open the database. If the database has existing data,
-    /// compressed vectors are reloaded into RAM automatically.
+    /// Create or open the database. Rebuilds inverted index on startup.
     pub fn new(path: &str) -> Result<Self, sled::Error> {
         let disk = sled::open(path)?;
 
-        // Reload compressed vectors from the "compressed" tree
         let mut ram = Vec::new();
         let compressed_tree = disk.open_tree("compressed")?;
         for entry in compressed_tree.iter() {
@@ -202,54 +199,82 @@ impl Database {
             }
         }
 
+        // Reconstruct inverted index
+        let mut inverted_index: HashMap<String, HashSet<u64>> = HashMap::new();
+        let metadata_tree = disk.open_tree("metadata")?;
+        for entry in metadata_tree.iter() {
+            let (key, value) = entry?;
+            if let Ok(id) = key[..8].try_into().map(u64::from_be_bytes) {
+                if let Ok(meta) = serde_json::from_slice::<HashMap<String, String>>(&value) {
+                    for (k, v) in meta {
+                        let filter_key = format!("{}:{}", k, v);
+                        inverted_index.entry(filter_key).or_default().insert(id);
+                    }
+                }
+            }
+        }
+
         if !ram.is_empty() {
             tracing::info!("Restored {} compressed vectors from disk", ram.len());
         }
-        tracing::info!("Database opened at: {} ({} vectors)", path, ram.len());
 
-        Ok(Database { ram: RwLock::new(ram), disk })
+        Ok(Database { 
+            ram: RwLock::new(ram), 
+            inverted_index: RwLock::new(inverted_index),
+            disk 
+        })
     }
 
-    /// Insert a vector into both tiers. Mathematical compression and disk I/O are
-    /// lock-free. Only pushing to RAM takes a brief Write lock.
+    /// Insert a vector with optional metadata
     pub fn insert(
         &self,
         index: &TurboIndex,
         vector: &[f32],
         id: u64,
+        metadata: Option<&HashMap<String, String>>
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Step 1: Compress (CPU only, no locks)
         let packed = compress_vector(index, vector, id);
 
-        // Step 2: Persist compressed vector to disk
         let compressed_tree = self.disk.open_tree("compressed")?;
         let serialized = serde_json::to_vec(&packed)?;
         compressed_tree.insert(id.to_be_bytes(), serialized)?;
 
-        // Step 3: Insert raw vector to disk
         let key = id.to_be_bytes();
         let value: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
         self.disk.insert(key, value)?;
 
-        // Step 4: Add to RAM (Brief lock)
-        self.ram.write().unwrap().push(packed);
+        if let Some(meta) = metadata {
+            if !meta.is_empty() {
+                let metadata_tree = self.disk.open_tree("metadata")?;
+                metadata_tree.insert(id.to_be_bytes(), serde_json::to_vec(meta)?)?;
+                
+                let mut index_guard = self.inverted_index.write().unwrap();
+                for (k, v) in meta {
+                    let filter_key = format!("{}:{}", k, v);
+                    index_guard.entry(filter_key).or_default().insert(id);
+                }
+            }
+        }
 
+        self.ram.write().unwrap().push(packed);
         Ok(())
     }
 
-    /// Insert a batch of vectors.
+    /// Insert a batch of vectors with metadata
     pub fn insert_batch(
         &self,
         index: &TurboIndex,
-        vectors: &[(u64, Vec<f32>)],
+        vectors: &[(u64, Vec<f32>, Option<HashMap<String, String>>)],
     ) -> Result<usize, Box<dyn std::error::Error>> {
         let mut count = 0;
         let mut new_packed = Vec::with_capacity(vectors.len());
 
-        // Process all math and disk IO completely lock free first
         let compressed_tree = self.disk.open_tree("compressed")?;
+        let metadata_tree = self.disk.open_tree("metadata")?;
         
-        for (id, vector) in vectors {
+        let mut index_guard = self.inverted_index.write().unwrap();
+
+        for (id, vector, meta_opt) in vectors {
             let packed = compress_vector(index, vector, *id);
             let serialized = serde_json::to_vec(&packed)?;
             compressed_tree.insert(id.to_be_bytes(), serialized)?;
@@ -257,25 +282,67 @@ impl Database {
             let key = id.to_be_bytes();
             let value: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
             self.disk.insert(key, value)?;
+
+            if let Some(meta) = meta_opt {
+                if !meta.is_empty() {
+                    metadata_tree.insert(id.to_be_bytes(), serde_json::to_vec(meta)?)?;
+                    for (k, v) in meta {
+                        let filter_key = format!("{}:{}", k, v);
+                        index_guard.entry(filter_key).or_default().insert(*id);
+                    }
+                }
+            }
             
             new_packed.push(packed);
             count += 1;
         }
 
-        // Apply to RAM all at once
         self.ram.write().unwrap().extend(new_packed);
-
         Ok(count)
     }
 
-    /// Delete a vector by ID from both RAM and disk.
+    /// Get valid IDs matching all filters. Returns None if no filters provided.
+    pub fn get_filtered_ids(&self, filter: &HashMap<String, String>) -> Option<HashSet<u64>> {
+        if filter.is_empty() { return None; }
+        let guard = self.inverted_index.read().unwrap();
+        let mut result: Option<HashSet<u64>> = None;
+
+        for (k, v) in filter {
+            let filter_key = format!("{}:{}", k, v);
+            let matches = guard.get(&filter_key).cloned().unwrap_or_default();
+            match result {
+                None => result = Some(matches),
+                Some(ref mut current) => current.retain(|id| matches.contains(id)),
+            }
+        }
+        
+        result.map(|mut r| {
+            if r.is_empty() { r.insert(u64::MAX); } // Invalidate if zero matches
+            r
+        })
+    }
+
+    /// Delete a vector
     pub fn delete(&self, id: u64) -> Result<bool, Box<dyn std::error::Error>> {
-        // Disk delete
         self.disk.remove(id.to_be_bytes())?;
         let compressed_tree = self.disk.open_tree("compressed")?;
         compressed_tree.remove(id.to_be_bytes())?;
 
-        // RAM delete
+        // Remove from metadata logic
+        let metadata_tree = self.disk.open_tree("metadata")?;
+        if let Ok(Some(meta_bytes)) = metadata_tree.get(id.to_be_bytes()) {
+            if let Ok(meta) = serde_json::from_slice::<HashMap<String, String>>(&meta_bytes) {
+                let mut index_guard = self.inverted_index.write().unwrap();
+                for (k, v) in meta {
+                    let filter_key = format!("{}:{}", k, v);
+                    if let Some(set) = index_guard.get_mut(&filter_key) {
+                        set.remove(&id);
+                    }
+                }
+            }
+            metadata_tree.remove(id.to_be_bytes())?;
+        }
+
         let mut ram = self.ram.write().unwrap();
         let original_len = ram.len();
         ram.retain(|v| v.id != id);

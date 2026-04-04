@@ -8,7 +8,7 @@ use crate::turbo_math::TurboIndex;
 use nalgebra::DVector;
 use ordered_float::OrderedFloat;
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 
 type ScoredItem = Reverse<(OrderedFloat<f32>, u64)>;
 
@@ -21,8 +21,9 @@ pub fn search_ram_store(
     db: &[PackedVector],
     query: &[f32],
     top_k: usize,
+    valid_ids: Option<&HashSet<u64>>,
 ) -> Vec<(u64, f32)> {
-    search_ram_store_with_options(index, db, query, top_k, false)
+    search_ram_store_with_options(index, db, query, top_k, false, valid_ids)
 }
 
 /// Search with explicit QJL control.
@@ -32,6 +33,7 @@ pub fn search_ram_store_with_options(
     query: &[f32],
     top_k: usize,
     use_qjl: bool,
+    valid_ids: Option<&HashSet<u64>>,
 ) -> Vec<(u64, f32)> {
     let d = index.d;
     assert_eq!(query.len(), d, "Query dimension mismatch");
@@ -61,6 +63,12 @@ pub fn search_ram_store_with_options(
     let mut heap: BinaryHeap<ScoredItem> = BinaryHeap::with_capacity(top_k + 1);
 
     for packed in db.iter() {
+        if let Some(valid) = valid_ids {
+            if !valid.contains(&packed.id) {
+                continue;
+            }
+        }
+
         // Unpack MSE indices
         let indices = unpack_indices(&packed.mse_packed, d, index.bits);
 
@@ -118,12 +126,13 @@ pub fn hybrid_search(
     index: &TurboIndex,
     query: &[f32],
     top_k: usize,
+    valid_ids: Option<&HashSet<u64>>,
 ) -> Vec<(u64, f32)> {
     let shortlist_size = 100.min(db.len());
     
     // Acquire temporary read lock to scan RAM
     let ram_guard = db.ram.read().unwrap();
-    let shortlist = search_ram_store(index, &ram_guard, query, shortlist_size);
+    let shortlist = search_ram_store(index, &ram_guard, query, shortlist_size, valid_ids);
     drop(ram_guard);
 
     let mut q = DVector::from_column_slice(query);
@@ -152,10 +161,11 @@ pub fn batch_search(
     db: &[PackedVector],
     queries: &[Vec<f32>],
     top_k: usize,
+    valid_ids: Option<&HashSet<u64>>,
 ) -> Vec<Vec<(u64, f32)>> {
     queries
         .iter()
-        .map(|q| search_ram_store(index, db, q, top_k))
+        .map(|q| search_ram_store(index, db, q, top_k, valid_ids))
         .collect()
 }
 
@@ -191,7 +201,7 @@ mod tests {
             }
 
             let query = &raw_vectors[25];
-            let results = search_ram_store(&index, &db, query, 5);
+            let results = search_ram_store(&index, &db, query, 5, None);
 
             assert!(!results.is_empty());
             let top_ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
@@ -216,7 +226,7 @@ mod tests {
         }
 
         let query = random_vector(d, &mut rng);
-        let results = search_ram_store(&index, &db, &query, 5);
+        let results = search_ram_store(&index, &db, &query, 5, None);
 
         for (_, score) in &results {
             assert!(score.is_finite(), "Score is not finite: {}", score);
@@ -236,7 +246,7 @@ mod tests {
         }
 
         let queries: Vec<Vec<f32>> = (0..3).map(|_| random_vector(d, &mut rng)).collect();
-        let all_results = batch_search(&index, &db, &queries, 5);
+        let all_results = batch_search(&index, &db, &queries, 5, None);
 
         assert_eq!(all_results.len(), 3);
         for results in &all_results {

@@ -48,7 +48,7 @@ fn run_benchmark(d: usize, bits: BitWidth, num_vectors: usize) -> BenchmarkResul
     let mut hits = 0;
     for i in 0..search_runs {
         let query = &raw_vectors[i];
-        let results = search_ram_store(&index, &db, query, 1);
+        let results = search_ram_store(&index, &db, query, 1, None);
         if !results.is_empty() && results[0].0 == i as u64 {
             hits += 1;
         }

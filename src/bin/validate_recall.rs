@@ -5,9 +5,8 @@
 //! This is the test that proves our numbers are real.
 
 use rand::Rng;
-use std::time::Instant;
 use tvectordb::execution_engine::search_ram_store;
-use tvectordb::storage_engine::{compress_vector, l2_normalize, PackedVector};
+use tvectordb::storage_engine::{compress_vector, PackedVector};
 use tvectordb::turbo_math::{BitWidth, TurboIndex};
 use nalgebra::DVector;
 
@@ -64,7 +63,7 @@ fn compute_cosine_error(
     let mut count = 0;
 
     for query in queries {
-        let approx_results = search_ram_store(index, db, query, 1);
+        let approx_results = search_ram_store(index, db, query, 1, None);
         if approx_results.is_empty() { continue; }
 
         let (approx_id, approx_score) = approx_results[0];
@@ -120,9 +119,7 @@ fn main() {
         .map(|_| (0..d).map(|_| rng.gen::<f32>() - 0.5).collect())
         .collect();
 
-    // Also test "self-recall": can we find vectors we inserted?
-    let self_queries: Vec<Vec<f32>> = raw_vectors[0..num_queries.min(num_vectors)]
-        .to_vec();
+    // Generating self queries for potential test, unused here
 
     println!("┌────────┬─────────┬─────────┬──────────┬──────────────┬────────────┐");
     println!("│  Bits  │  R@1    │  R@5    │  R@10    │ Mean Cos Err │ Mean Drift │");
@@ -146,9 +143,9 @@ fn main() {
 
         for query in &queries {
             // Approximate results
-            let approx_1 = search_ram_store(&index, &db, query, 1);
-            let approx_5 = search_ram_store(&index, &db, query, 5);
-            let approx_10 = search_ram_store(&index, &db, query, 10);
+            let approx_1 = search_ram_store(&index, &db, query, 1, None);
+            let approx_5 = search_ram_store(&index, &db, query, 5, None);
+            let approx_10 = search_ram_store(&index, &db, query, 10, None);
 
             // Exact ground truth
             let exact_10 = brute_force_search(&raw_vectors, query, 10);
