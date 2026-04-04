@@ -1,0 +1,41 @@
+[package]
+name = "tvectordb"
+version = "0.1.0"
+edition = "2021"
+description = "T-VectorDB: Zero-latency, 16x compressed, LLM-native vector database built on TurboQuant"
+license = "MIT"
+repository = "https://github.com/your-username/T-VectorDB"
+readme = "README.md"
+keywords = ["vector-database", "quantization", "similarity-search", "embeddings", "turbo-quant"]
+categories = ["database", "science", "algorithms"]
+
+[dependencies]
+# Linear algebra (pure Rust — no C/Fortran deps)
+nalgebra = "0.33"
+
+# Random number generation
+rand = "0.8"
+rand_distr = "0.4"
+
+# Disk-based key-value store (pure Rust — no C deps)
+sled = "0.34"
+
+# HTTP framework
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Float ordering for BinaryHeap
+ordered-float = "4"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
