@@ -16,8 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Protobuf Compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+      # No need to install system protoc — we use protoc-bin-vendored in build.rs
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -32,7 +31,7 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Run Clippy Linter
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Run Unit Tests
         run: cargo test --release --verbose
@@ -54,15 +53,49 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .
 
-      - name: Test Python Output
+      - name: Test Python Import
         working-directory: ./clients/python
         run: |
           python -c "import tvectordb; print('T-VectorDB Python SDK imported successfully!')"
 
   docker-build:
-    name: Test Docker Build
+    name: Test Docker Build & Smoke Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Build Docker Image
         run: docker build -t tvectordb:test .
+
+      - name: Smoke Test — Start Container
+        run: |
+          # Start the container in background with small dims for fast startup
+          docker run -d --name tvdb-test \
+            -p 3000:3000 \
+            -e TVECTORDB_DIM=64 \
+            -e TVECTORDB_BITS=2 \
+            tvectordb:test
+
+          # Wait for server to be ready
+          echo "Waiting for server..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000/ > /dev/null 2>&1; then
+              echo "Server is up!"
+              break
+            fi
+            sleep 1
+          done
+
+          # Verify health endpoint
+          curl -sf http://localhost:3000/ | grep -q "running"
+
+          # Verify stats endpoint
+          curl -sf http://localhost:3000/stats | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['dimension']==64, f'Expected dim=64, got {d[\"dimension\"]}'"
+
+          echo "Docker smoke test passed!"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop tvdb-test || true
+          docker rm tvdb-test || true

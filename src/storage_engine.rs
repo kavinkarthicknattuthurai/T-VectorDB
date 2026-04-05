@@ -1,10 +1,12 @@
-//! # Storage Engine V2 — Multi Bit-Width Compression, Persistence, and Batch Ops
+//! # Storage Engine V3 — Multi Bit-Width Compression, Persistence, HNSW Integration
 //!
 //! Implements:
 //! - `PackedVector`: Configurable 2/3/4-bit MSE compression + 1-bit QJL residual
 //! - `compress_vector()`: Full TurboQuant compression at any bit-width
 //! - `Database`: Two-tier RAM + Disk store with persistence across restarts
-//! - Batch insert with parallel compression via Rayon
+//! - Atomic insert (RAM + HNSW in single lock scope)
+//! - Tombstone-based delete (no index shifting)
+//! - HNSW graph persistence via sled
 
 use crate::turbo_math::{BitWidth, TurboIndex};
 use nalgebra::DVector;
@@ -18,7 +20,7 @@ use serde::{Deserialize, Serialize};
 pub fn pack_indices(indices: &[u8], bits: BitWidth) -> Vec<u8> {
     let bits_per = bits.bits();
     let total_bits = indices.len() * bits_per;
-    let num_bytes = (total_bits + 7) / 8;
+    let num_bytes = total_bits.div_ceil(8);
     let mut packed = vec![0u8; num_bytes];
 
     for (i, &idx) in indices.iter().enumerate() {
@@ -151,7 +153,7 @@ pub fn compress_vector(index: &TurboIndex, vector: &[f32], id: u64) -> PackedVec
 
     // Step 6: QJL projection: z = S · r, extract signs
     let z = &index.s * &residual;
-    let qjl_byte_count = (d + 7) / 8;
+    let qjl_byte_count = d.div_ceil(8);
     let mut qjl_bits = Vec::with_capacity(qjl_byte_count);
     for chunk_start in (0..d).step_by(8) {
         let mut bits = [0u8; 8];
@@ -170,18 +172,21 @@ use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 use crate::hnsw::{HnswConfig, HnswGraph};
 
-/// Two-tier database with persistence and HNSW graph index.
+/// Two-tier database with persistence, HNSW graph index, and tombstone deletion.
 ///
 /// - RAM: Compressed vectors for fast approximate search
-/// - HNSW: Multi-layer graph for O(log n) search
+/// - HNSW: Multi-layer graph for O(log n) search with tombstone support
 /// - Inverted Index: Optional metadata string-matching
-/// - Disk (sled): Full-precision vectors and serialized metadata
+/// - Disk (sled): Full-precision vectors, serialized metadata, and HNSW graph
 pub struct Database {
     /// Tier 1: Compressed vectors in RAM (RwLock protected)
     pub ram: RwLock<Vec<PackedVector>>,
 
     /// HNSW graph index for sub-linear search
     pub hnsw: RwLock<HnswGraph>,
+
+    /// Mapping from vector ID to RAM index for O(1) lookup
+    id_to_ram_idx: RwLock<HashMap<u64, usize>>,
 
     /// Inverted Index mapping `key:value` to a set of Vector IDs
     pub inverted_index: RwLock<HashMap<String, HashSet<u64>>>,
@@ -191,15 +196,19 @@ pub struct Database {
 }
 
 impl Database {
-    /// Create or open the database. Rebuilds inverted index and HNSW graph on startup.
+    /// Create or open the database. Rebuilds inverted index on startup.
+    /// HNSW graph is loaded from disk if available, otherwise rebuilt.
     pub fn new(path: &str) -> Result<Self, sled::Error> {
         let disk = sled::open(path)?;
 
         let mut ram = Vec::new();
+        let mut id_to_ram_idx = HashMap::new();
         let compressed_tree = disk.open_tree("compressed")?;
         for entry in compressed_tree.iter() {
             let (_, value) = entry?;
             if let Ok(packed) = serde_json::from_slice::<PackedVector>(&value) {
+                let idx = ram.len();
+                id_to_ram_idx.insert(packed.id, idx);
                 ram.push(packed);
             }
         }
@@ -219,27 +228,61 @@ impl Database {
             }
         }
 
-        // Initialize empty HNSW graph (will be rebuilt after index is available)
-        let hnsw = HnswGraph::new(HnswConfig::default());
+        // Try to load persisted HNSW graph
+        let hnsw_tree = disk.open_tree("hnsw")?;
+        let hnsw = if let Ok(Some(graph_bytes)) = hnsw_tree.get("graph") {
+            match HnswGraph::from_bytes(&graph_bytes) {
+                Ok(graph) => {
+                    tracing::info!("Restored HNSW graph from disk ({} nodes, {} layers)",
+                        graph.len(), graph.max_layer_count());
+                    graph
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to restore HNSW graph: {}. Will rebuild.", e);
+                    HnswGraph::new(HnswConfig::default())
+                }
+            }
+        } else {
+            HnswGraph::new(HnswConfig::default())
+        };
 
         if !ram.is_empty() {
             tracing::info!("Restored {} compressed vectors from disk", ram.len());
         }
 
-        Ok(Database { 
-            ram: RwLock::new(ram), 
+        Ok(Database {
+            ram: RwLock::new(ram),
             hnsw: RwLock::new(hnsw),
+            id_to_ram_idx: RwLock::new(id_to_ram_idx),
             inverted_index: RwLock::new(inverted_index),
-            disk 
+            disk,
         })
     }
 
+    /// Persist the HNSW graph to disk for fast restarts.
+    pub fn persist_hnsw(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let graph = self.hnsw.read().unwrap();
+        let bytes = graph.to_bytes()?;
+        let hnsw_tree = self.disk.open_tree("hnsw")?;
+        hnsw_tree.insert("graph", bytes)?;
+        Ok(())
+    }
+
     /// Rebuild the HNSW graph from the existing RAM vectors.
-    /// Called once after startup when the TurboIndex is available.
+    /// Called once after startup when the TurboIndex is available and no persisted graph exists.
     pub fn rebuild_hnsw(&self, index: &TurboIndex) {
         let ram = self.ram.read().unwrap();
         let n = ram.len();
         if n == 0 { return; }
+
+        // Check if graph already has nodes (loaded from disk)
+        {
+            let graph = self.hnsw.read().unwrap();
+            if !graph.is_empty() {
+                tracing::info!("HNSW graph already loaded from disk, skipping rebuild");
+                return;
+            }
+        }
 
         tracing::info!("Rebuilding HNSW graph for {} vectors...", n);
         let start = std::time::Instant::now();
@@ -254,9 +297,18 @@ impl Database {
             elapsed, graph.len(), graph.max_layer_count());
 
         *self.hnsw.write().unwrap() = graph;
+
+        // Persist the graph
+        drop(ram);
+        if let Err(e) = self.persist_hnsw() {
+            tracing::warn!("Failed to persist HNSW graph: {}", e);
+        }
     }
 
-    /// Insert a vector with optional metadata
+    /// Insert a vector with optional metadata.
+    ///
+    /// This operation is atomic: the RAM push and HNSW insert happen
+    /// within a single write lock scope to prevent race conditions.
     pub fn insert(
         &self,
         index: &TurboIndex,
@@ -266,6 +318,7 @@ impl Database {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let packed = compress_vector(index, vector, id);
 
+        // Persist to disk first
         let compressed_tree = self.disk.open_tree("compressed")?;
         let serialized = serde_json::to_vec(&packed)?;
         compressed_tree.insert(id.to_be_bytes(), serialized)?;
@@ -278,7 +331,7 @@ impl Database {
             if !meta.is_empty() {
                 let metadata_tree = self.disk.open_tree("metadata")?;
                 metadata_tree.insert(id.to_be_bytes(), serde_json::to_vec(meta)?)?;
-                
+
                 let mut index_guard = self.inverted_index.write().unwrap();
                 for (k, v) in meta {
                     let filter_key = format!("{}:{}", k, v);
@@ -287,56 +340,91 @@ impl Database {
             }
         }
 
-        // Push compressed vector to RAM
-        self.ram.write().unwrap().push(packed);
+        // ATOMIC: Push to RAM and insert into HNSW in one lock scope
+        // This prevents the race condition where another thread could
+        // push between our push and our HNSW insert.
+        {
+            let mut ram = self.ram.write().unwrap();
+            let node_idx = ram.len();
+            ram.push(packed);
 
-        // Insert into HNSW graph using the raw vector for best graph quality
-        let ram = self.ram.read().unwrap();
-        let node_idx = ram.len() - 1;
-        let mut graph = self.hnsw.write().unwrap();
-        graph.insert_with_raw(node_idx, &ram, index, Some(vector));
+            let mut id_map = self.id_to_ram_idx.write().unwrap();
+            id_map.insert(id, node_idx);
+
+            let mut graph = self.hnsw.write().unwrap();
+            graph.insert_with_raw(node_idx, &ram, index, Some(vector));
+        }
 
         Ok(())
     }
 
-    /// Insert a batch of vectors with metadata
+    /// Insert a batch of vectors with metadata.
+    /// Each vector is incrementally inserted into the HNSW graph.
     pub fn insert_batch(
         &self,
         index: &TurboIndex,
         vectors: &[(u64, Vec<f32>, Option<HashMap<String, String>>)],
     ) -> Result<usize, Box<dyn std::error::Error>> {
         let mut count = 0;
-        let mut new_packed = Vec::with_capacity(vectors.len());
 
         let compressed_tree = self.disk.open_tree("compressed")?;
         let metadata_tree = self.disk.open_tree("metadata")?;
-        
-        let mut index_guard = self.inverted_index.write().unwrap();
 
-        for (id, vector, meta_opt) in vectors {
+        // Pre-compress all vectors
+        let mut new_packed: Vec<(PackedVector, &[f32])> = Vec::with_capacity(vectors.len());
+        for (id, vector, _) in vectors {
             let packed = compress_vector(index, vector, *id);
+
+            // Persist compressed vector
             let serialized = serde_json::to_vec(&packed)?;
             compressed_tree.insert(id.to_be_bytes(), serialized)?;
-            
+
+            // Persist raw vector
             let key = id.to_be_bytes();
             let value: Vec<u8> = vector.iter().flat_map(|f| f.to_le_bytes()).collect();
             self.disk.insert(key, value)?;
 
-            if let Some(meta) = meta_opt {
-                if !meta.is_empty() {
-                    metadata_tree.insert(id.to_be_bytes(), serde_json::to_vec(meta)?)?;
-                    for (k, v) in meta {
-                        let filter_key = format!("{}:{}", k, v);
-                        index_guard.entry(filter_key).or_default().insert(*id);
+            new_packed.push((packed, vector));
+        }
+
+        // Handle metadata
+        {
+            let mut index_guard = self.inverted_index.write().unwrap();
+            for (id, _, meta_opt) in vectors {
+                if let Some(meta) = meta_opt {
+                    if !meta.is_empty() {
+                        metadata_tree.insert(id.to_be_bytes(), serde_json::to_vec(meta)?)?;
+                        for (k, v) in meta {
+                            let filter_key = format!("{}:{}", k, v);
+                            index_guard.entry(filter_key).or_default().insert(*id);
+                        }
                     }
                 }
             }
-            
-            new_packed.push(packed);
-            count += 1;
         }
 
-        self.ram.write().unwrap().extend(new_packed);
+        // ATOMIC: Push all to RAM and incrementally insert into HNSW
+        {
+            let mut ram = self.ram.write().unwrap();
+            let mut graph = self.hnsw.write().unwrap();
+            let mut id_map = self.id_to_ram_idx.write().unwrap();
+
+            for (packed, raw_vector) in new_packed {
+                let node_idx = ram.len();
+                let id = packed.id;
+                ram.push(packed);
+                id_map.insert(id, node_idx);
+
+                graph.insert_with_raw(node_idx, &ram, index, Some(raw_vector));
+                count += 1;
+            }
+        }
+
+        // Persist updated HNSW graph
+        if let Err(e) = self.persist_hnsw() {
+            tracing::warn!("Failed to persist HNSW graph after batch insert: {}", e);
+        }
+
         Ok(count)
     }
 
@@ -354,20 +442,26 @@ impl Database {
                 Some(ref mut current) => current.retain(|id| matches.contains(id)),
             }
         }
-        
+
         result.map(|mut r| {
             if r.is_empty() { r.insert(u64::MAX); } // Invalidate if zero matches
             r
         })
     }
 
-    /// Delete a vector
+    /// Delete a vector using tombstone-based deletion.
+    ///
+    /// The vector is removed from disk and the inverted index,
+    /// and tombstoned in the HNSW graph. The RAM slot is NOT removed
+    /// (indices remain stable). The compressed data remains in RAM
+    /// but is never returned by search.
     pub fn delete(&self, id: u64) -> Result<bool, Box<dyn std::error::Error>> {
+        // Remove from disk
         self.disk.remove(id.to_be_bytes())?;
         let compressed_tree = self.disk.open_tree("compressed")?;
         compressed_tree.remove(id.to_be_bytes())?;
 
-        // Remove from metadata logic
+        // Remove from metadata and inverted index
         let metadata_tree = self.disk.open_tree("metadata")?;
         if let Ok(Some(meta_bytes)) = metadata_tree.get(id.to_be_bytes()) {
             if let Ok(meta) = serde_json::from_slice::<HashMap<String, String>>(&meta_bytes) {
@@ -382,12 +476,23 @@ impl Database {
             metadata_tree.remove(id.to_be_bytes())?;
         }
 
-        let mut ram = self.ram.write().unwrap();
-        let original_len = ram.len();
-        ram.retain(|v| v.id != id);
-        let removed = ram.len() < original_len;
+        // Tombstone in HNSW graph (O(1) — no index shifting)
+        let id_map = self.id_to_ram_idx.read().unwrap();
+        if let Some(&ram_idx) = id_map.get(&id) {
+            let mut graph = self.hnsw.write().unwrap();
+            graph.mark_deleted(ram_idx);
 
-        Ok(removed)
+            // Persist updated graph
+            drop(graph);
+            drop(id_map);
+            if let Err(e) = self.persist_hnsw() {
+                tracing::warn!("Failed to persist HNSW graph after delete: {}", e);
+            }
+
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Retrieve the full-precision vector from disk by ID.
@@ -413,8 +518,27 @@ impl Database {
         self.ram.read().unwrap().iter().map(|v| v.size_bytes()).sum()
     }
 
-    pub fn len(&self) -> usize { self.ram.read().unwrap().len() }
-    pub fn is_empty(&self) -> bool { self.ram.read().unwrap().is_empty() }
+    /// Number of live (non-deleted) vectors.
+    pub fn len(&self) -> usize {
+        let graph = self.hnsw.read().unwrap();
+        let ram_len = self.ram.read().unwrap().len();
+        // If HNSW has tombstones, subtract them
+        if graph.total_nodes() > 0 {
+            ram_len.saturating_sub(graph.deleted_count())
+        } else {
+            ram_len
+        }
+    }
+
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+
+    /// Flush all pending writes to disk. Call on shutdown.
+    pub fn flush(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.disk.flush()?;
+        self.persist_hnsw()?;
+        tracing::info!("Database flushed to disk successfully");
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -481,5 +605,41 @@ mod tests {
         assert!((norm - 5.0).abs() < 1e-6);
         assert!((v[0] - 0.6).abs() < 1e-6);
         assert!((v[1] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_database_insert_delete_consistency() {
+        let d = 64;
+        let index = TurboIndex::new(d, BitWidth::Bits4);
+        let dir = std::env::temp_dir().join("tvdb_test_delete");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let db = Database::new(dir.to_str().unwrap()).unwrap();
+
+        // Insert 10 vectors
+        for i in 0..10u64 {
+            let v: Vec<f32> = (0..d).map(|j| (i as f32 + j as f32) * 0.01).collect();
+            db.insert(&index, &v, i, None).unwrap();
+        }
+
+        assert_eq!(db.len(), 10);
+
+        // Delete vector 5
+        let deleted = db.delete(5).unwrap();
+        assert!(deleted);
+        assert_eq!(db.len(), 9);
+
+        // Verify vector 5 is not returned by HNSW search
+        let query: Vec<f32> = (0..d).map(|j| (5.0 + j as f32) * 0.01).collect();
+        let graph = db.hnsw.read().unwrap();
+        let ram = db.ram.read().unwrap();
+        let results = graph.search(&query, &index, &ram, 10, 100, None);
+        let result_ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
+        assert!(!result_ids.contains(&5), "Deleted vector 5 should not appear in results");
+
+        // Cleanup
+        drop(ram);
+        drop(graph);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

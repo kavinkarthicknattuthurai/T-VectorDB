@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "T-VectorDB: Zero-latency, 16x compressed, LLM-native vector database built on TurboQuant"
 license = "MIT"
-repository = "https://github.com/your-username/T-VectorDB"
+repository = "https://github.com/kavinkarthicknattuthurai/T-VectorDB"
 readme = "README.md"
 keywords = ["vector-database", "quantization", "similarity-search", "embeddings", "turbo-quant"]
 categories = ["database", "science", "algorithms"]
@@ -36,6 +36,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 dashmap = "6.1.0"
 tonic = "0.12.0"
+tower-http = { version = "0.6", features = ["cors"] }
 prost = "0.13.0"
 
 [profile.release]

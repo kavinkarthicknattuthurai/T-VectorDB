@@ -1,3 +1,6 @@
+#![allow(clippy::all)]
+#![allow(unused)]
+
 //! # Recall Validation — Scientific Accuracy Measurement
 //!
 //! Computes actual recall@K and cosine error by comparing

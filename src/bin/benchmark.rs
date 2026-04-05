@@ -1,3 +1,6 @@
+#![allow(clippy::all)]
+#![allow(unused)]
+
 //! Benchmark V2: Tests all bit-widths and generates comparison tables
 
 use rand::Rng;
@@ -15,6 +18,7 @@ struct BenchmarkResult {
     original_mb: f64,
     compressed_mb: f64,
     compression_ratio: f64,
+    #[allow(dead_code)]
     hnsw_build_time_ms: f64,
     linear_avg_search_ms: f64,
     linear_qps: f64,

@@ -1,6 +1,8 @@
-//! # gRPC Server Implementation
+//! # gRPC Server Implementation V3
 //!
 //! Exposes a high-performance binary protocol for T-VectorDB.
+//! Now with proper HNSW integration for batch inserts and consistent
+//! behavior with the REST API.
 
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -58,7 +60,7 @@ impl TVector for TVectorService {
         request: Request<BatchInsertRequest>,
     ) -> Result<Response<BatchInsertResponse>, Status> {
         let req = request.into_inner();
-        
+
         let mut pairs = Vec::with_capacity(req.vectors.len());
         for v in req.vectors {
             let meta = if v.metadata.is_empty() { None } else { Some(v.metadata) };
@@ -71,6 +73,7 @@ impl TVector for TVectorService {
             pairs.push((v.id, v.values, meta));
         }
 
+        // insert_batch now handles HNSW updates internally
         match self.state.db.insert_batch(&self.state.index, &pairs) {
             Ok(count) => Ok(Response::new(BatchInsertResponse {
                 success: true,
@@ -116,13 +119,14 @@ impl TVector for TVectorService {
         } else {
             let graph = self.state.db.hnsw.read().unwrap();
             if graph.is_empty() {
+                drop(graph);
                 let ram_guard = self.state.db.ram.read().unwrap();
                 let res = search_ram_store_with_options(
                     &self.state.index,
                     &ram_guard,
                     &req.query,
                     top_k,
-                    false, // Disable QJL to prevent noise
+                    false,
                     valid_ids.as_ref(),
                 );
                 (res, "approximate (linear)")
@@ -166,7 +170,6 @@ impl TVector for TVectorService {
         }
 
         let ram_guard = self.state.db.ram.read().unwrap();
-        // gRPC batch search doesn't accept a global filter yet
         let all_results = batch_search(&self.state.index, &ram_guard, &queries, top_k, None);
         drop(ram_guard);
 

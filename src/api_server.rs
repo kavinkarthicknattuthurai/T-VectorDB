@@ -1,8 +1,8 @@
-//! # REST API Server V2 — Full-Featured HTTP Endpoints
+//! # REST API Server V3 — Full-Featured HTTP Endpoints with CORS
 //!
 //! Endpoints:
 //! - `GET  /`          — Health check
-//! - `GET  /stats`     — Database statistics + memory footprint
+//! - `GET  /stats`     — Database statistics + memory + HNSW graph info
 //! - `POST /insert`    — Insert a single vector
 //! - `POST /insert_batch` — Insert multiple vectors
 //! - `POST /search`    — Search (approximate or exact hybrid)
@@ -15,11 +15,12 @@ use crate::turbo_math::TurboIndex;
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{header, Method, StatusCode},
     routing::{delete, get, post},
     Json, Router,
 };
 use std::sync::Arc;
+use tower_http::cors::{Any, CorsLayer};
 
 /// Type alias for batch insert tuples: (id, vector, optional metadata)
 type VectorTuple = (u64, Vec<f32>, Option<std::collections::HashMap<String, String>>);
@@ -114,6 +115,9 @@ pub struct StatsResponse {
     pub compression_ratio: String,
     pub ram_memory_bytes: usize,
     pub ram_memory_mb: f64,
+    pub hnsw_nodes: usize,
+    pub hnsw_layers: usize,
+    pub hnsw_deleted: usize,
     pub version: String,
 }
 
@@ -134,6 +138,7 @@ async fn health() -> &'static str {
 
 async fn stats(State(state): State<Arc<AppState>>) -> Json<StatsResponse> {
     let mem = state.db.memory_bytes();
+    let graph = state.db.hnsw.read().unwrap();
     Json(StatsResponse {
         total_vectors: state.db.len(),
         dimension: state.index.d,
@@ -141,6 +146,9 @@ async fn stats(State(state): State<Arc<AppState>>) -> Json<StatsResponse> {
         compression_ratio: format!("{:.1}x", state.index.bits.compression_ratio()),
         ram_memory_bytes: mem,
         ram_memory_mb: mem as f64 / 1_048_576.0,
+        hnsw_nodes: graph.len(),
+        hnsw_layers: graph.max_layer_count(),
+        hnsw_deleted: graph.deleted_count(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
 }
@@ -192,8 +200,7 @@ async fn insert_batch(
 
     match state.db.insert_batch(&state.index, &pairs) {
         Ok(count) => {
-            // Rebuild HNSW for batch (more efficient than per-vector)
-            state.db.rebuild_hnsw(&state.index);
+            // No need to rebuild HNSW — batch insert now does incremental HNSW updates
             Ok(Json(BatchInsertResponse {
                 success: true,
                 inserted: count,
@@ -228,6 +235,7 @@ async fn search(
         let graph = state.db.hnsw.read().unwrap();
         if graph.is_empty() {
             // Fallback to linear scan if graph not built
+            drop(graph);
             let ram_guard = state.db.ram.read().unwrap();
             let res = search_ram_store(&state.index, &ram_guard, &payload.vector, payload.top_k, valid_ids.as_ref());
             (res, "approximate (linear)")
@@ -258,7 +266,6 @@ async fn search_batch_handler(
     }
 
     let ram_guard = state.db.ram.read().unwrap();
-    // Batch Search in REST doesn't accept a global filter yet, so we pass None
     let all_results = batch_search(&state.index, &ram_guard, &payload.vectors, payload.top_k, None);
     drop(ram_guard);
 
@@ -285,6 +292,12 @@ async fn delete_vector(
 // ============================================================================
 
 pub fn create_router(state: Arc<AppState>) -> Router {
+    // CORS: Allow all origins for open-source use
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
+
     Router::new()
         .route("/", get(health))
         .route("/stats", get(stats))
@@ -293,5 +306,6 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/search", post(search))
         .route("/search_batch", post(search_batch_handler))
         .route("/vectors/{id}", delete(delete_vector))
+        .layer(cors)
         .with_state(state)
 }

@@ -43,13 +43,15 @@ impl BitWidth {
     }
 
     /// Values per packed byte.
+    #[allow(dead_code)]
     pub fn values_per_byte(&self) -> usize {
         8 / self.bits()
     }
 
     /// Number of packed bytes needed for `d` dimensions.
+    #[allow(dead_code)]
     pub fn packed_bytes(&self, d: usize) -> usize {
-        (d * self.bits() + 7) / 8
+        (d * self.bits()).div_ceil(8)
     }
 
     /// Compression ratio vs Float32.

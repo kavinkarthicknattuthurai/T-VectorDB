@@ -9,14 +9,15 @@
 //! Algorithm (Malkov & Yashunin, 2018):
 //! - Insert: assign random layer, greedy descend, connect to M nearest at each layer
 //! - Search: descend from top layer, expand with beam width `ef` at layer 0
+//!
+//! Tombstone deletion: deleted nodes are marked and skipped during search,
+//! without invalidating any indices. Periodic compaction reclaims space.
 
 use crate::storage_engine::{unpack_indices, PackedVector};
 use crate::turbo_math::TurboIndex;
 use nalgebra::DVector;
-use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::HashSet;
 
 // ============================================================================
 // LUT (Lookup Table) — Extracted for reuse by both linear scan and HNSW
@@ -99,6 +100,9 @@ impl Default for HnswConfig {
 ///
 /// Stores neighbor lists for each node at each layer. Nodes are indexed
 /// by their position in the `Database.ram` vector (not by vector ID).
+///
+/// Supports tombstone-based deletion: deleted nodes are marked and skipped
+/// during search without invalidating any indices.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct HnswGraph {
     /// Config parameters
@@ -111,8 +115,10 @@ pub struct HnswGraph {
     entry_point: Option<usize>,
     /// Highest layer in the graph
     max_layer: usize,
-    /// Total number of nodes
+    /// Total number of nodes (including tombstoned)
     num_nodes: usize,
+    /// Tombstoned (deleted) node indices — skipped during search
+    deleted: HashSet<usize>,
 }
 
 impl HnswGraph {
@@ -125,34 +131,77 @@ impl HnswGraph {
             entry_point: None,
             max_layer: 0,
             num_nodes: 0,
+            deleted: HashSet::new(),
         }
     }
 
-    /// Number of nodes in the graph.
+    /// Number of live (non-deleted) nodes in the graph.
     pub fn len(&self) -> usize {
+        self.num_nodes.saturating_sub(self.deleted.len())
+    }
+
+    /// Total nodes including tombstoned.
+    pub fn total_nodes(&self) -> usize {
         self.num_nodes
     }
 
+    /// Number of tombstoned nodes.
+    pub fn deleted_count(&self) -> usize {
+        self.deleted.len()
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.num_nodes == 0
+        self.len() == 0
     }
 
     /// Number of layers in the graph.
     pub fn max_layer_count(&self) -> usize {
+        if self.num_nodes == 0 { return 0; }
         self.max_layer + 1
+    }
+
+    /// Mark a node as deleted (tombstone). O(1) operation.
+    /// The node's edges remain in the graph but it will be skipped during search.
+    pub fn mark_deleted(&mut self, node_idx: usize) {
+        self.deleted.insert(node_idx);
+
+        // If we deleted the entry point, find a new one
+        if self.entry_point == Some(node_idx) {
+            self.entry_point = self.find_new_entry_point();
+            if let Some(ep) = self.entry_point {
+                self.max_layer = self.node_max_layer.get(ep).copied().unwrap_or(0);
+            }
+        }
+    }
+
+    /// Find a new entry point (highest-layer non-deleted node).
+    fn find_new_entry_point(&self) -> Option<usize> {
+        let mut best_node = None;
+        let mut best_layer = 0;
+        for (idx, &layer) in self.node_max_layer.iter().enumerate() {
+            if !self.deleted.contains(&idx) && (best_node.is_none() || layer > best_layer) {
+                best_node = Some(idx);
+                best_layer = layer;
+            }
+        }
+        best_node
+    }
+
+    /// Check if compaction is recommended (>20% tombstones).
+    #[allow(dead_code)]
+    pub fn needs_compaction(&self) -> bool {
+        self.num_nodes > 0 && self.deleted.len() * 5 > self.num_nodes
     }
 
     /// Randomly assign a layer for a new node using exponential decay.
     fn random_level(&self) -> usize {
         let r: f64 = rand::random::<f64>();
-        let level = (-r.ln() * self.config.ml).floor() as usize;
-        level
+        (-r.ln() * self.config.ml).floor() as usize
     }
 
     /// Insert a new node (index `node_idx`) into the graph.
     ///
     /// `db` is the full RAM vector store so we can compute distances.
-    /// `raw_vector` is the original float32 vector (if available) for high-quality LUT.
     pub fn insert(
         &mut self,
         node_idx: usize,
@@ -237,8 +286,9 @@ impl HnswGraph {
                 self.config.ef_construction,
             );
 
-            // Select M closest as neighbors
+            // Select M closest as neighbors (skip deleted nodes)
             let neighbors: Vec<usize> = candidates.iter()
+                .filter(|&&(idx, _)| !self.deleted.contains(&idx))
                 .take(m_max)
                 .map(|&(idx, _)| idx)
                 .collect();
@@ -316,9 +366,13 @@ impl HnswGraph {
             ef.max(top_k),
         );
 
-        // Apply metadata filter and return top_k
+        // Apply metadata filter, skip deleted nodes, and return top_k
         let mut results: Vec<(u64, f32)> = candidates.into_iter()
             .filter(|&(idx, _)| {
+                // Skip tombstoned nodes
+                if self.deleted.contains(&idx) {
+                    return false;
+                }
                 if let Some(valid) = valid_ids {
                     valid.contains(&db[idx].id)
                 } else {
@@ -331,6 +385,20 @@ impl HnswGraph {
 
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         results
+    }
+
+    // ========================================================================
+    // Persistence
+    // ========================================================================
+
+    /// Serialize the HNSW graph to bytes for persistence.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    /// Deserialize an HNSW graph from bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(serde_json::from_slice(bytes)?)
     }
 
     // ========================================================================
@@ -347,20 +415,25 @@ impl HnswGraph {
         layer: usize,
     ) -> usize {
         let mut best = ep;
-        let mut best_score = score_packed(lut, &db[ep], index.bits);
+        let mut best_score = if ep < db.len() {
+            score_packed(lut, &db[ep], index.bits)
+        } else {
+            f32::NEG_INFINITY
+        };
 
         let mut changed = true;
         while changed {
             changed = false;
             if layer < self.layers.len() && best < self.layers[layer].len() {
                 for &neighbor in &self.layers[layer][best] {
-                    if neighbor < db.len() {
-                        let s = score_packed(lut, &db[neighbor], index.bits);
-                        if s > best_score {
-                            best_score = s;
-                            best = neighbor;
-                            changed = true;
-                        }
+                    if neighbor >= db.len() { continue; }
+                    // Skip tombstoned nodes during traversal for scoring,
+                    // but still traverse through them to find live nodes
+                    let s = score_packed(lut, &db[neighbor], index.bits);
+                    if s > best_score && !self.deleted.contains(&neighbor) {
+                        best_score = s;
+                        best = neighbor;
+                        changed = true;
                     }
                 }
             }
@@ -393,7 +466,9 @@ impl HnswGraph {
             visited.insert(ep);
             let s = score_packed(lut, &db[ep], index.bits);
             candidates.push((ep, s));
-            results.push((ep, s));
+            if !self.deleted.contains(&ep) {
+                results.push((ep, s));
+            }
         }
 
         // Sort candidates best-first (highest score first)
@@ -426,6 +501,18 @@ impl HnswGraph {
 
                     let s = score_packed(lut, &db[neighbor], index.bits);
 
+                    // Always add to candidates for traversal (even if deleted)
+                    let pos = candidates[candidate_idx..].iter()
+                        .position(|(_, cs)| s > *cs)
+                        .map(|p| p + candidate_idx)
+                        .unwrap_or(candidates.len());
+                    candidates.insert(pos, (neighbor, s));
+
+                    // Only add non-deleted to results
+                    if self.deleted.contains(&neighbor) {
+                        continue;
+                    }
+
                     let should_add = if results.len() < ef {
                         true
                     } else {
@@ -433,13 +520,6 @@ impl HnswGraph {
                     };
 
                     if should_add {
-                        // Insert into candidates in sorted position
-                        let pos = candidates[candidate_idx..].iter()
-                            .position(|(_, cs)| s > *cs)
-                            .map(|p| p + candidate_idx)
-                            .unwrap_or(candidates.len());
-                        candidates.insert(pos, (neighbor, s));
-
                         results.push((neighbor, s));
 
                         // Keep results at ef size
@@ -562,6 +642,82 @@ mod tests {
             top_ids.contains(&42),
             "HNSW: Expected vector 42 in top-10, got: {:?}", top_ids
         );
+    }
+
+    #[test]
+    fn test_hnsw_delete_tombstone() {
+        let d = 64;
+        let n = 100;
+        let index = TurboIndex::new(d, BitWidth::Bits4);
+        let mut rng = rand::thread_rng();
+
+        let mut raw_vectors: Vec<Vec<f32>> = Vec::new();
+        let mut db: Vec<PackedVector> = Vec::new();
+        for i in 0..n {
+            let v = random_vector(d, &mut rng);
+            db.push(compress_vector(&index, &v, i as u64));
+            raw_vectors.push(v);
+        }
+
+        let config = HnswConfig::default();
+        let mut graph = HnswGraph::new(config);
+        for i in 0..n {
+            graph.insert_with_raw(i, &db, &index, Some(&raw_vectors[i]));
+        }
+
+        // Delete vector 42
+        graph.mark_deleted(42);
+
+        assert_eq!(graph.len(), n - 1);
+        assert_eq!(graph.deleted_count(), 1);
+
+        // Search should NOT return vector 42
+        let query = &raw_vectors[42];
+        let results = graph.search(query, &index, &db, 10, 200, None);
+        let result_ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
+        assert!(
+            !result_ids.contains(&42),
+            "Deleted vector 42 should not appear in results, got: {:?}", result_ids
+        );
+    }
+
+    #[test]
+    fn test_hnsw_persistence_roundtrip() {
+        let d = 64;
+        let n = 50;
+        let index = TurboIndex::new(d, BitWidth::Bits4);
+        let mut rng = rand::thread_rng();
+
+        let mut raw_vectors: Vec<Vec<f32>> = Vec::new();
+        let mut db: Vec<PackedVector> = Vec::new();
+        for i in 0..n {
+            let v = random_vector(d, &mut rng);
+            db.push(compress_vector(&index, &v, i as u64));
+            raw_vectors.push(v);
+        }
+
+        let config = HnswConfig::default();
+        let mut graph = HnswGraph::new(config);
+        for i in 0..n {
+            graph.insert_with_raw(i, &db, &index, Some(&raw_vectors[i]));
+        }
+
+        // Serialize and deserialize
+        let bytes = graph.to_bytes().unwrap();
+        let restored = HnswGraph::from_bytes(&bytes).unwrap();
+
+        assert_eq!(restored.len(), graph.len());
+        assert_eq!(restored.max_layer_count(), graph.max_layer_count());
+
+        // Search should produce same results
+        let query = &raw_vectors[10];
+        let original_results = graph.search(query, &index, &db, 5, 100, None);
+        let restored_results = restored.search(query, &index, &db, 5, 100, None);
+
+        assert_eq!(original_results.len(), restored_results.len());
+        for (a, b) in original_results.iter().zip(restored_results.iter()) {
+            assert_eq!(a.0, b.0, "Result IDs differ after persistence roundtrip");
+        }
     }
 
     #[test]

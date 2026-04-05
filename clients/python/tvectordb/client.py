@@ -187,7 +187,7 @@ class TVectorClient:
             List of result lists, one per query
         """
         pb_queries = [
-            tvectordb_pb2.QueryVector(values=v) for v in vectors
+            tvectordb_pb2.SearchQuery(values=v) for v in vectors
         ]
         request = tvectordb_pb2.BatchSearchRequest(
             queries=pb_queries,

@@ -17,8 +17,9 @@ Unlike traditional databases that require slow global locks or K-Means warmups, 
 | **Lock-Free Concurrency** | ✅ | ❌ | ✅ | ✅ |
 | **O(1) Metadata Filtering** | ✅ | ❌ | ✅ | ✅ |
 | **Python SDK** | ✅ Native gRPC | ❌ | ✅ | ✅ |
-| REST API | ✅ | ❌ | ✅ | ✅ |
-| Persistence | ✅ | ❌ | ✅ | ✅ |
+| **REST API + CORS** | ✅ | ❌ | ✅ | ✅ |
+| **Zero-Downtime Tombstone Deletes** | ✅ | ❌ | ❌ | ✅ |
+| **Graceful Shutdown (Sled/HNSW)** | ✅ | ❌ | ❌ | ❌ |
 | Zero C/C++ Dependencies | ✅ | ✅ | ❌ | N/A |
 
 ## 🧠 How It Works
@@ -113,7 +114,14 @@ docker run -d \
 ```
 
 **3. Advanced Configuration Override:**
-You can pass flags directly to the container to modify the database precision exactly like the CLI:
+We highly recommend using Environment Variables (`-e`) to configure the database in Docker, as this prevents clashes with the internal volumes:
+```bash
+docker run -p 3000:3000 -p 50051:50051 \
+  -e TVECTORDB_DIM=384 \
+  -e TVECTORDB_BITS=4 \
+  tvectordb
+```
+Alternatively, you can pass CLI flags which append to the entrypoint:
 ```bash
 docker run -p 3000:3000 -p 50051:50051 tvectordb --dim 384 --bits 4
 ```
