@@ -274,6 +274,16 @@ cargo run --release --bin benchmark
 | 3-bit | 10.7 ms | 93 | 100% | 7.5x |
 | 2-bit | 9.5 ms | 106 | 100% | 9.8x |
 
+## 🏗️ Built With T-VectorDB
+
+Applications powered by T-VectorDB — showing what you can build:
+
+| Project | Description | Link |
+|---------|-------------|------|
+| **DocMind** | Local-first RAG app — chat with your PDFs using Ollama | [GitHub](https://github.com/kavinkarthicknattuthurai/DocMind) |
+
+*Building something with T-VectorDB? Open a PR to add it here!*
+
 ## 📜 License
 
 MIT License. See [LICENSE](LICENSE).
